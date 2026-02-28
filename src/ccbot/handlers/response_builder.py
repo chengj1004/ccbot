@@ -13,7 +13,7 @@ Key function:
   - build_response_parts: Build paginated response messages
 """
 
-from ..html_converter import split_message
+from ..telegram_sender import split_message
 from ..transcript_parser import TranscriptParser
 
 

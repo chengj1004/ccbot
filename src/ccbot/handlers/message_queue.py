@@ -27,27 +27,23 @@ from telegram import Bot
 from telegram.constants import ChatAction
 from telegram.error import RetryAfter
 
-from ..html_converter import convert_markdown, strip_sentinels
+from ..markdown_v2 import convert_markdown
 from ..session import session_manager
 from ..terminal_parser import parse_status_line
 from ..tmux_manager import tmux_manager
-from .message_sender import NO_LINK_PREVIEW, PARSE_MODE, send_photo, send_with_fallback
+from .message_sender import (
+    NO_LINK_PREVIEW,
+    PARSE_MODE,
+    send_photo,
+    send_with_fallback,
+    strip_sentinels,
+)
 
 logger = logging.getLogger(__name__)
 
-# HTML tags that indicate text is already converted
-_HTML_TAGS = ("<pre>", "<code>", "<b>", "<i>", "<a ", "<blockquote", "<u>", "<s>")
 
-
-def _is_already_html(text: str) -> bool:
-    """Check if text already contains Telegram HTML formatting."""
-    return any(tag in text for tag in _HTML_TAGS)
-
-
-def _ensure_html(text: str) -> str:
-    """Convert to HTML only if not already converted."""
-    if _is_already_html(text):
-        return text
+def _ensure_formatted(text: str) -> str:
+    """Convert markdown to MarkdownV2."""
     return convert_markdown(text)
 
 
@@ -320,7 +316,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                 await bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=edit_msg_id,
-                    text=_ensure_html(full_text),
+                    text=_ensure_formatted(full_text),
                     parse_mode=PARSE_MODE,
                     link_preview_options=NO_LINK_PREVIEW,
                 )
@@ -420,7 +416,7 @@ async def _convert_status_to_content(
         await bot.edit_message_text(
             chat_id=chat_id,
             message_id=msg_id,
-            text=_ensure_html(content_text),
+            text=_ensure_formatted(content_text),
             parse_mode=PARSE_MODE,
             link_preview_options=NO_LINK_PREVIEW,
         )
@@ -489,7 +485,7 @@ async def _process_status_update_task(
                 await bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=msg_id,
-                    text=_ensure_html(status_text),
+                    text=_ensure_formatted(status_text),
                     parse_mode=PARSE_MODE,
                     link_preview_options=NO_LINK_PREVIEW,
                 )

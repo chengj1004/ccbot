@@ -117,7 +117,7 @@ from .handlers.message_sender import (
     safe_send,
     send_with_fallback,
 )
-from .html_converter import convert_markdown
+from .markdown_v2 import convert_markdown
 from .handlers.response_builder import build_response_parts
 from .handlers.status_polling import status_poll_loop
 from .screenshot import text_to_image

@@ -1,9 +1,9 @@
-"""Safe message sending helpers with HTML formatting.
+"""Safe message sending helpers with MarkdownV2 fallback.
 
 Provides utility functions for sending Telegram messages with automatic
 format conversion and fallback to plain text on failure.
 
-Uses chatgpt-md-converter for HTML formatting with tag-aware splitting.
+Uses telegramify-markdown for MarkdownV2 formatting.
 
 Functions:
   - send_with_fallback: Send with formatting → plain text fallback
@@ -23,27 +23,28 @@ from typing import Any
 from telegram import Bot, InputMediaPhoto, LinkPreviewOptions, Message
 from telegram.error import RetryAfter
 
-from ..html_converter import convert_markdown, strip_sentinels
+from ..markdown_v2 import convert_markdown
+from ..transcript_parser import TranscriptParser
 
 logger = logging.getLogger(__name__)
 
-# HTML tags that indicate text is already converted
-_HTML_TAGS = ("<pre>", "<code>", "<b>", "<i>", "<a ", "<blockquote", "<u>", "<s>")
+
+def strip_sentinels(text: str) -> str:
+    """Strip expandable quote sentinel markers for plain text fallback."""
+    for s in (
+        TranscriptParser.EXPANDABLE_QUOTE_START,
+        TranscriptParser.EXPANDABLE_QUOTE_END,
+    ):
+        text = text.replace(s, "")
+    return text
 
 
-def _is_already_html(text: str) -> bool:
-    """Check if text already contains Telegram HTML formatting."""
-    return any(tag in text for tag in _HTML_TAGS)
-
-
-def _ensure_html(text: str) -> str:
-    """Convert to HTML only if not already converted."""
-    if _is_already_html(text):
-        return text
+def _ensure_formatted(text: str) -> str:
+    """Convert markdown to MarkdownV2."""
     return convert_markdown(text)
 
 
-PARSE_MODE = "HTML"
+PARSE_MODE = "MarkdownV2"
 
 
 # Disable link previews in all messages to reduce visual noise
@@ -65,7 +66,7 @@ async def send_with_fallback(
     try:
         return await bot.send_message(
             chat_id=chat_id,
-            text=_ensure_html(text),
+            text=_ensure_formatted(text),
             parse_mode=PARSE_MODE,
             **kwargs,
         )
@@ -130,7 +131,7 @@ async def safe_reply(message: Message, text: str, **kwargs: Any) -> Message:
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
     try:
         return await message.reply_text(
-            _ensure_html(text),
+            _ensure_formatted(text),
             parse_mode=PARSE_MODE,
             **kwargs,
         )
@@ -151,7 +152,7 @@ async def safe_edit(target: Any, text: str, **kwargs: Any) -> None:
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
     try:
         await target.edit_message_text(
-            _ensure_html(text),
+            _ensure_formatted(text),
             parse_mode=PARSE_MODE,
             **kwargs,
         )
@@ -180,7 +181,7 @@ async def safe_send(
     try:
         await bot.send_message(
             chat_id=chat_id,
-            text=_ensure_html(text),
+            text=_ensure_formatted(text),
             parse_mode=PARSE_MODE,
             **kwargs,
         )

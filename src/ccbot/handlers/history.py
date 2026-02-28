@@ -14,7 +14,7 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
 from ..config import config
 from ..session import session_manager
-from ..html_converter import split_message
+from ..telegram_sender import split_message
 from ..transcript_parser import TranscriptParser
 from .callback_data import CB_HISTORY_NEXT, CB_HISTORY_PREV
 from .message_sender import safe_edit, safe_reply, safe_send
