@@ -389,6 +389,9 @@ class TmuxManager:
 
                 wid = window.window_id or ""
 
+                # Prevent Claude Code from overriding window name
+                window.set_window_option("allow-rename", "off")
+
                 # Start Claude Code if requested
                 if start_claude:
                     pane = window.active_pane
