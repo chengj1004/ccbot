@@ -73,6 +73,9 @@ from .handlers.callback_data import (
     CB_DIR_UP,
     CB_HISTORY_NEXT,
     CB_HISTORY_PREV,
+    CB_SESSION_CANCEL,
+    CB_SESSION_NEW,
+    CB_SESSION_SELECT,
     CB_KEYS_PREFIX,
     CB_SCREENSHOT_REFRESH,
     CB_WIN_BIND,
@@ -83,13 +86,17 @@ from .handlers.directory_browser import (
     BROWSE_DIRS_KEY,
     BROWSE_PAGE_KEY,
     BROWSE_PATH_KEY,
+    SESSIONS_KEY,
     STATE_BROWSING_DIRECTORY,
     STATE_KEY,
+    STATE_SELECTING_SESSION,
     STATE_SELECTING_WINDOW,
     UNBOUND_WINDOWS_KEY,
     build_directory_browser,
+    build_session_picker,
     build_window_picker,
     clear_browse_state,
+    clear_session_picker_state,
     clear_window_picker_state,
 )
 from .handlers.cleanup import clear_topic_state
@@ -764,6 +771,24 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         context.user_data.pop("_pending_thread_id", None)
         context.user_data.pop("_pending_thread_text", None)
 
+    # Ignore text in session picker mode (only for the same thread)
+    if (
+        context.user_data
+        and context.user_data.get(STATE_KEY) == STATE_SELECTING_SESSION
+    ):
+        pending_tid = context.user_data.get("_pending_thread_id")
+        if pending_tid == thread_id:
+            await safe_reply(
+                update.message,
+                "Please use the session picker above, or tap Cancel.",
+            )
+            return
+        # Stale picker state from a different thread — clear it
+        clear_session_picker_state(context.user_data)
+        context.user_data.pop("_pending_thread_id", None)
+        context.user_data.pop("_pending_thread_text", None)
+        context.user_data.pop("_selected_path", None)
+
     # Must be in a named topic
     if thread_id is None:
         await safe_reply(
@@ -880,6 +905,120 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if interactive_window and interactive_window == wid:
         await asyncio.sleep(0.2)
         await handle_interactive_ui(context.bot, user.id, wid, thread_id)
+
+
+# --- Window creation helper ---
+
+
+async def _create_and_bind_window(
+    query: object,
+    context: ContextTypes.DEFAULT_TYPE,
+    user: object,
+    selected_path: str,
+    pending_thread_id: int | None,
+    resume_session_id: str | None = None,
+) -> None:
+    """Create a tmux window, bind it to a topic, and forward pending text.
+
+    Shared by CB_DIR_CONFIRM (no sessions), CB_SESSION_NEW, and CB_SESSION_SELECT.
+    """
+    from telegram import CallbackQuery, User
+
+    assert isinstance(query, CallbackQuery)
+    assert isinstance(user, User)
+
+    success, message, created_wname, created_wid = await tmux_manager.create_window(
+        selected_path, resume_session_id=resume_session_id
+    )
+    if success:
+        logger.info(
+            "Window created: %s (id=%s) at %s (user=%d, thread=%s, resume=%s)",
+            created_wname,
+            created_wid,
+            selected_path,
+            user.id,
+            pending_thread_id,
+            resume_session_id,
+        )
+        # Wait for Claude Code's SessionStart hook to register in session_map
+        await session_manager.wait_for_session_map_entry(created_wid)
+
+        # --resume creates a new session_id in the hook, but messages continue
+        # writing to the resumed session's JSONL file. Override window_state to
+        # track the original session_id so the monitor can route messages back.
+        if resume_session_id:
+            ws = session_manager.get_window_state(created_wid)
+            if ws.session_id != resume_session_id:
+                logger.info(
+                    "Resume override: window %s session_id %s -> %s",
+                    created_wid,
+                    ws.session_id,
+                    resume_session_id,
+                )
+                ws.session_id = resume_session_id
+                session_manager._save_state()
+
+        if pending_thread_id is not None:
+            # Thread bind flow: bind thread to newly created window
+            session_manager.bind_thread(
+                user.id, pending_thread_id, created_wid, window_name=created_wname
+            )
+
+            # Rename the topic to match the window name
+            resolved_chat = session_manager.resolve_chat_id(user.id, pending_thread_id)
+            try:
+                await context.bot.edit_forum_topic(
+                    chat_id=resolved_chat,
+                    message_thread_id=pending_thread_id,
+                    name=created_wname,
+                )
+            except Exception as e:
+                logger.debug(f"Failed to rename topic: {e}")
+
+            status = "Resumed" if resume_session_id else "Created"
+            await safe_edit(
+                query,
+                f"✅ {message}\n\n{status}. Send messages here.",
+            )
+
+            # Send pending text if any
+            pending_text = (
+                context.user_data.get("_pending_thread_text")
+                if context.user_data
+                else None
+            )
+            if pending_text:
+                logger.debug(
+                    "Forwarding pending text to window %s (len=%d)",
+                    created_wname,
+                    len(pending_text),
+                )
+                if context.user_data is not None:
+                    context.user_data.pop("_pending_thread_text", None)
+                    context.user_data.pop("_pending_thread_id", None)
+                send_ok, send_msg = await session_manager.send_to_window(
+                    created_wid,
+                    pending_text,
+                )
+                if not send_ok:
+                    logger.warning("Failed to forward pending text: %s", send_msg)
+                    await safe_send(
+                        context.bot,
+                        resolved_chat,
+                        f"❌ Failed to send pending message: {send_msg}",
+                        message_thread_id=pending_thread_id,
+                    )
+            elif context.user_data is not None:
+                context.user_data.pop("_pending_thread_id", None)
+        else:
+            # Should not happen in topic-only mode, but handle gracefully
+            await safe_edit(query, f"✅ {message}")
+    else:
+        await safe_edit(query, f"❌ {message}")
+        if pending_thread_id is not None and context.user_data is not None:
+            context.user_data.pop("_pending_thread_id", None)
+            context.user_data.pop("_pending_thread_text", None)
+    await query.answer("Created" if success else "Failed")
 
 
 # --- Callback query handler ---
@@ -1072,83 +1211,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         clear_browse_state(context.user_data)
 
-        success, message, created_wname, created_wid = await tmux_manager.create_window(
-            selected_path
+        # Check for existing sessions in this directory
+        sessions = await session_manager.list_sessions_for_directory(selected_path)
+        if sessions:
+            # Show session picker — store state for later
+            if context.user_data is not None:
+                context.user_data[STATE_KEY] = STATE_SELECTING_SESSION
+                context.user_data[SESSIONS_KEY] = sessions
+                context.user_data["_selected_path"] = selected_path
+            text, keyboard = build_session_picker(sessions)
+            await safe_edit(query, text, reply_markup=keyboard)
+            await query.answer()
+            return
+
+        # No existing sessions — create new window directly
+        await _create_and_bind_window(
+            query, context, user, selected_path, pending_thread_id
         )
-        if success:
-            logger.info(
-                "Window created: %s (id=%s) at %s (user=%d, thread=%s)",
-                created_wname,
-                created_wid,
-                selected_path,
-                user.id,
-                pending_thread_id,
-            )
-            # Wait for Claude Code's SessionStart hook to register in session_map
-            await session_manager.wait_for_session_map_entry(created_wid)
-
-            if pending_thread_id is not None:
-                # Thread bind flow: bind thread to newly created window
-                session_manager.bind_thread(
-                    user.id, pending_thread_id, created_wid, window_name=created_wname
-                )
-
-                # Rename the topic to match the window name
-                resolved_chat = session_manager.resolve_chat_id(
-                    user.id, pending_thread_id
-                )
-                try:
-                    await context.bot.edit_forum_topic(
-                        chat_id=resolved_chat,
-                        message_thread_id=pending_thread_id,
-                        name=created_wname,
-                    )
-                except Exception as e:
-                    logger.debug(f"Failed to rename topic: {e}")
-
-                await safe_edit(
-                    query,
-                    f"✅ {message}\n\nBound to this topic. Send messages here.",
-                )
-
-                # Send pending text if any
-                pending_text = (
-                    context.user_data.get("_pending_thread_text")
-                    if context.user_data
-                    else None
-                )
-                if pending_text:
-                    logger.debug(
-                        "Forwarding pending text to window %s (len=%d)",
-                        created_wname,
-                        len(pending_text),
-                    )
-                    if context.user_data is not None:
-                        context.user_data.pop("_pending_thread_text", None)
-                        context.user_data.pop("_pending_thread_id", None)
-                    send_ok, send_msg = await session_manager.send_to_window(
-                        created_wid,
-                        pending_text,
-                    )
-                    if not send_ok:
-                        logger.warning("Failed to forward pending text: %s", send_msg)
-                        await safe_send(
-                            context.bot,
-                            resolved_chat,
-                            f"❌ Failed to send pending message: {send_msg}",
-                            message_thread_id=pending_thread_id,
-                        )
-                elif context.user_data is not None:
-                    context.user_data.pop("_pending_thread_id", None)
-            else:
-                # Should not happen in topic-only mode, but handle gracefully
-                await safe_edit(query, f"✅ {message}")
-        else:
-            await safe_edit(query, f"❌ {message}")
-            if pending_thread_id is not None and context.user_data is not None:
-                context.user_data.pop("_pending_thread_id", None)
-                context.user_data.pop("_pending_thread_text", None)
-        await query.answer("Created" if success else "Failed")
 
     elif data == CB_DIR_CANCEL:
         pending_tid = (
@@ -1161,6 +1240,85 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if context.user_data is not None:
             context.user_data.pop("_pending_thread_id", None)
             context.user_data.pop("_pending_thread_text", None)
+        await safe_edit(query, "Cancelled")
+        await query.answer("Cancelled")
+
+    # Session picker: resume existing session
+    elif data.startswith(CB_SESSION_SELECT):
+        pending_tid = (
+            context.user_data.get("_pending_thread_id") if context.user_data else None
+        )
+        # Fallback: if _pending_thread_id was cleared (e.g. by a message in
+        # another topic), recover it from the callback query's message context
+        if pending_tid is None:
+            pending_tid = _get_thread_id(update)
+        if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            await query.answer("Stale picker (topic mismatch)", show_alert=True)
+            return
+        try:
+            idx = int(data[len(CB_SESSION_SELECT) :])
+        except ValueError:
+            await query.answer("Invalid data")
+            return
+
+        cached_sessions = (
+            context.user_data.get(SESSIONS_KEY, []) if context.user_data else []
+        )
+        if idx < 0 or idx >= len(cached_sessions):
+            await query.answer("Session not found")
+            return
+
+        session = cached_sessions[idx]
+        selected_path = (
+            context.user_data.get("_selected_path", str(Path.cwd()))
+            if context.user_data
+            else str(Path.cwd())
+        )
+        clear_session_picker_state(context.user_data)
+        if context.user_data is not None:
+            context.user_data.pop("_selected_path", None)
+
+        await _create_and_bind_window(
+            query,
+            context,
+            user,
+            selected_path,
+            pending_tid,
+            resume_session_id=session.session_id,
+        )
+
+    elif data == CB_SESSION_NEW:
+        pending_tid = (
+            context.user_data.get("_pending_thread_id") if context.user_data else None
+        )
+        if pending_tid is None:
+            pending_tid = _get_thread_id(update)
+        if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            await query.answer("Stale picker (topic mismatch)", show_alert=True)
+            return
+        selected_path = (
+            context.user_data.get("_selected_path", str(Path.cwd()))
+            if context.user_data
+            else str(Path.cwd())
+        )
+        clear_session_picker_state(context.user_data)
+        if context.user_data is not None:
+            context.user_data.pop("_selected_path", None)
+
+        await _create_and_bind_window(query, context, user, selected_path, pending_tid)
+
+    elif data == CB_SESSION_CANCEL:
+        pending_tid = (
+            context.user_data.get("_pending_thread_id") if context.user_data else None
+        )
+        if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            await query.answer("Stale picker (topic mismatch)", show_alert=True)
+            return
+        clear_session_picker_state(context.user_data)
+        if context.user_data is not None:
+            context.user_data.pop("_pending_thread_id", None)
+            context.user_data.pop("_pending_thread_text", None)
+            context.user_data.pop("_selected_path", None)
         await safe_edit(query, "Cancelled")
         await query.answer("Cancelled")
 

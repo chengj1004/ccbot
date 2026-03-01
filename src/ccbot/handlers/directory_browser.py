@@ -13,9 +13,13 @@ Key components:
   - clear_browse_state: Clear browsing state from user_data
 """
 
+import os
+import time
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+from ..session import ClaudeSession
 
 from ..config import config
 from .callback_data import (
@@ -24,6 +28,9 @@ from .callback_data import (
     CB_DIR_PAGE,
     CB_DIR_SELECT,
     CB_DIR_UP,
+    CB_SESSION_CANCEL,
+    CB_SESSION_NEW,
+    CB_SESSION_SELECT,
     CB_WIN_BIND,
     CB_WIN_CANCEL,
     CB_WIN_NEW,
@@ -40,6 +47,8 @@ BROWSE_PATH_KEY = "browse_path"
 BROWSE_PAGE_KEY = "browse_page"
 BROWSE_DIRS_KEY = "browse_dirs"  # Cache of subdirs for current path
 UNBOUND_WINDOWS_KEY = "unbound_windows"  # Cache of (name, cwd) tuples
+STATE_SELECTING_SESSION = "selecting_session"
+SESSIONS_KEY = "cached_sessions"  # Cache of ClaudeSession list
 
 
 def clear_browse_state(user_data: dict | None) -> None:
@@ -56,6 +65,13 @@ def clear_window_picker_state(user_data: dict | None) -> None:
     if user_data is not None:
         user_data.pop(STATE_KEY, None)
         user_data.pop(UNBOUND_WINDOWS_KEY, None)
+
+
+def clear_session_picker_state(user_data: dict | None) -> None:
+    """Clear session picker state keys from user_data."""
+    if user_data is not None:
+        user_data.pop(STATE_KEY, None)
+        user_data.pop(SESSIONS_KEY, None)
 
 
 def build_window_picker(
@@ -175,3 +191,66 @@ def build_directory_browser(
         text = f"*Select Working Directory*\n\nCurrent: `{display_path}`\n\nTap a folder to enter, or select current directory"
 
     return text, InlineKeyboardMarkup(buttons), subdirs
+
+
+def _relative_time(file_path: str) -> str:
+    """Format file mtime as a human-readable relative time string."""
+    try:
+        mtime = os.path.getmtime(file_path)
+    except OSError:
+        return ""
+    delta = int(time.time() - mtime)
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        m = delta // 60
+        return f"{m}m ago"
+    if delta < 86400:
+        h = delta // 3600
+        return f"{h}h ago"
+    d = delta // 86400
+    return f"{d}d ago"
+
+
+def build_session_picker(
+    sessions: list[ClaudeSession],
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Build session picker UI for resuming an existing Claude session.
+
+    Args:
+        sessions: List of ClaudeSession objects (sorted by recency).
+
+    Returns: (text, keyboard).
+    """
+    lines = [
+        "*Resume Session?*\n",
+        "Existing sessions found in this directory.\n",
+    ]
+    for i, s in enumerate(sessions):
+        summary = s.summary[:40] + "…" if len(s.summary) > 40 else s.summary
+        rel = _relative_time(s.file_path)
+        time_str = f" ({rel})" if rel else ""
+        lines.append(f"{i + 1}. {summary} — {s.message_count} msgs{time_str}")
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    for i in range(0, len(sessions), 2):
+        row = []
+        for j in range(min(2, len(sessions) - i)):
+            s = sessions[i + j]
+            label = s.summary[:14] + "…" if len(s.summary) > 14 else s.summary
+            row.append(
+                InlineKeyboardButton(
+                    f"▶ {label}", callback_data=f"{CB_SESSION_SELECT}{i + j}"
+                )
+            )
+        buttons.append(row)
+
+    buttons.append(
+        [
+            InlineKeyboardButton("➕ New Session", callback_data=CB_SESSION_NEW),
+            InlineKeyboardButton("Cancel", callback_data=CB_SESSION_CANCEL),
+        ]
+    )
+
+    text = "\n".join(lines)
+    return text, InlineKeyboardMarkup(buttons)

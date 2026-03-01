@@ -24,6 +24,7 @@ Key methods for thread binding access:
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Iterator
@@ -572,12 +573,20 @@ class SessionManager:
         self._save_state()
         logger.info("Cleared session for window_id %s", window_id)
 
+    @staticmethod
+    def _encode_cwd(cwd: str) -> str:
+        """Encode a cwd path to match Claude Code's project directory naming.
+
+        Replaces all non-alphanumeric characters (except dash) with dashes.
+        E.g. /home/user_name/Code/project -> -home-user-name-Code-project
+        """
+        return re.sub(r"[^a-zA-Z0-9-]", "-", cwd)
+
     def _build_session_file_path(self, session_id: str, cwd: str) -> Path | None:
         """Build the direct file path for a session from session_id and cwd."""
         if not session_id or not cwd:
             return None
-        # Encode cwd: /data/code/ccbot -> -data-code-ccbot
-        encoded_cwd = cwd.replace("/", "-")
+        encoded_cwd = self._encode_cwd(cwd)
         return config.claude_projects_path / encoded_cwd / f"{session_id}.jsonl"
 
     async def _get_session_direct(
@@ -633,6 +642,42 @@ class SessionManager:
             message_count=message_count,
             file_path=str(file_path),
         )
+
+    # --- Directory session listing ---
+
+    async def list_sessions_for_directory(self, cwd: str) -> list[ClaudeSession]:
+        """List existing Claude sessions for a directory.
+
+        Encodes the cwd path to find the project directory under
+        ~/.claude/projects/{encoded_cwd}/, globs *.jsonl files, and
+        extracts summary info from each.
+
+        Returns a list sorted by mtime (most recent first), capped at 10.
+        """
+        encoded_cwd = self._encode_cwd(cwd)
+        project_dir = config.claude_projects_path / encoded_cwd
+        if not project_dir.is_dir():
+            return []
+
+        # Collect JSONL files sorted by mtime (newest first)
+        jsonl_files = sorted(
+            project_dir.glob("*.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+
+        # Skip sessions-index and cap at 10
+        sessions: list[ClaudeSession] = []
+        for f in jsonl_files:
+            if f.stem == "sessions-index":
+                continue
+            if len(sessions) >= 10:
+                break
+            session_id = f.stem
+            session = await self._get_session_direct(session_id, cwd)
+            if session and session.message_count > 0:
+                sessions.append(session)
+        return sessions
 
     # --- Window → Session resolution ---
 

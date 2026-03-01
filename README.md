@@ -29,6 +29,7 @@ In fact, CCBot itself was built this way — iterating on itself through Claude 
 - **Send messages** — Forward text to Claude Code via tmux keystrokes
 - **Slash command forwarding** — Send any `/command` directly to Claude Code (e.g. `/clear`, `/compact`, `/cost`)
 - **Create new sessions** — Start Claude Code sessions from Telegram via directory browser
+- **Resume sessions** — Pick up where you left off by resuming an existing Claude session in a directory
 - **Kill sessions** — Close a topic to auto-kill the associated tmux window
 - **Message history** — Browse conversation history with pagination (newest first)
 - **Hook-based session tracking** — Auto-associates tmux windows with Claude sessions via `SessionStart` hook
@@ -169,7 +170,8 @@ Any unrecognized `/command` is also forwarded to Claude Code as-is (e.g. `/revie
 1. Create a new topic in the Telegram group
 2. Send any message in the topic
 3. A directory browser appears — select the project directory
-4. A tmux window is created, `claude` starts, and your pending message is forwarded
+4. If the directory has existing Claude sessions, a session picker appears — choose one to resume or start fresh
+5. A tmux window is created, `claude` starts (with `--resume` if resuming), and your pending message is forwarded
 
 **Sending messages:**
 

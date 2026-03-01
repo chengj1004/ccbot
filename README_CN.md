@@ -26,6 +26,7 @@ CCBot 让你**通过 Telegram 无缝接管同一个会话**。核心设计思路
 - **发送消息** — 通过 tmux 按键将文字转发给 Claude Code
 - **斜杠命令转发** — 任何 `/command` 直接发送给 Claude Code（如 `/clear`、`/compact`、`/cost`）
 - **创建新会话** — 通过目录浏览器从 Telegram 启动 Claude Code 会话
+- **恢复会话** — 选择目录中已有的 Claude 会话继续上次的工作
 - **关闭会话** — 关闭话题自动终止关联的 tmux 窗口
 - **消息历史** — 分页浏览对话历史（默认显示最新）
 - **Hook 会话追踪** — 通过 `SessionStart` hook 自动关联 tmux 窗口与 Claude 会话
@@ -165,7 +166,8 @@ uv run ccbot
 1. 在 Telegram 群组中创建新话题
 2. 在话题中发送任意消息
 3. 弹出目录浏览器 — 选择项目目录
-4. 自动创建 tmux 窗口，启动 `claude`，并转发待处理的消息
+4. 如果该目录下已有 Claude 会话，会弹出会话选择器 — 选择恢复已有会话或创建新会话
+5. 自动创建 tmux 窗口，启动 `claude`（恢复时使用 `--resume`），并转发待处理的消息
 
 **发送消息：**
 
