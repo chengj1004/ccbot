@@ -19,7 +19,7 @@ from .utils import ccbot_dir
 logger = logging.getLogger(__name__)
 
 # Env vars that must not leak to child processes (e.g. Claude Code via tmux)
-SENSITIVE_ENV_VARS = {"TELEGRAM_BOT_TOKEN", "ALLOWED_USERS"}
+SENSITIVE_ENV_VARS = {"TELEGRAM_BOT_TOKEN", "ALLOWED_USERS", "OPENAI_API_KEY"}
 
 
 class Config:
@@ -91,6 +91,12 @@ class Config:
         # Show hidden (dot) directories in directory browser
         self.show_hidden_dirs = (
             os.getenv("CCBOT_SHOW_HIDDEN_DIRS", "").lower() == "true"
+        )
+
+        # OpenAI API for voice message transcription (optional)
+        self.openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
+        self.openai_base_url: str = os.getenv(
+            "OPENAI_BASE_URL", "https://api.openai.com/v1"
         )
 
         # Scrub sensitive vars from os.environ so child processes never inherit them.

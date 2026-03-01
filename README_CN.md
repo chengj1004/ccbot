@@ -23,6 +23,7 @@ CCBot 让你**通过 Telegram 无缝接管同一个会话**。核心设计思路
 - **基于话题的会话** — 每个 Telegram 话题 1:1 映射到一个 tmux 窗口和 Claude 会话
 - **实时通知** — 接收助手回复、思考过程、工具调用/结果、本地命令输出的 Telegram 消息
 - **交互式 UI** — 通过内联键盘操作 AskUserQuestion、ExitPlanMode 和权限提示
+- **语音消息** — 语音消息通过 OpenAI 转录为文字并转发
 - **发送消息** — 通过 tmux 按键将文字转发给 Claude Code
 - **斜杠命令转发** — 任何 `/command` 直接发送给 Claude Code（如 `/clear`、`/compact`、`/cost`）
 - **创建新会话** — 通过目录浏览器从 Telegram 启动 Claude Code 会话
@@ -91,6 +92,8 @@ ALLOWED_USERS=your_telegram_user_id
 | `CLAUDE_COMMAND` | `claude` | 新窗口中运行的命令 |
 | `MONITOR_POLL_INTERVAL` | `2.0` | 轮询间隔（秒） |
 | `CCBOT_SHOW_HIDDEN_DIRS` | `false` | 在目录浏览器中显示隐藏（点开头）目录 |
+| `OPENAI_API_KEY` | _(无)_ | OpenAI API 密钥，用于语音消息转录 |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI API 基础 URL（用于代理或兼容 API） |
 
 消息格式化目前固定为 HTML，使用 `chatgpt-md-converter`（`chatgpt_md_converter` 包）。
 不再提供运行时切换到 MarkdownV2 的开关。
@@ -171,7 +174,7 @@ uv run ccbot
 
 **发送消息：**
 
-话题绑定会话后，直接在话题中发送文字即可 — 文字会通过 tmux 按键转发给 Claude Code。
+话题绑定会话后，直接在话题中发送文字或语音消息即可 — 文字会通过 tmux 按键转发给 Claude Code，语音消息会自动转录为文字后转发。
 
 **关闭会话：**
 
@@ -272,6 +275,7 @@ src/ccbot/
 ├── terminal_parser.py     # 终端面板解析（交互式 UI + 状态行）
 ├── html_converter.py      # Markdown → Telegram HTML 转换 + HTML 感知拆分
 ├── screenshot.py          # 终端文字 → PNG 图片（支持 ANSI 颜色）
+├── transcribe.py          # 通过 OpenAI API 进行语音转文字
 ├── utils.py               # 通用工具（原子 JSON 写入、JSONL 辅助函数）
 ├── tmux_manager.py        # tmux 窗口管理（列出、创建、发送按键、终止）
 ├── fonts/                 # 截图渲染用字体

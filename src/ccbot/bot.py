@@ -12,8 +12,10 @@ Core responsibilities:
     Unbound topics trigger the directory browser to create a new session.
   - Photo handling: photos sent by user are downloaded and forwarded
     to Claude Code as file paths (photo_handler).
+  - Voice handling: voice messages are transcribed via OpenAI API and
+    forwarded as text (voice_handler).
   - Automatic cleanup: closing a topic kills the associated window
-    (topic_closed_handler). Unsupported content (stickers, voice, etc.)
+    (topic_closed_handler). Unsupported content (stickers, etc.)
     is rejected with a warning (unsupported_content_handler).
   - Bot lifecycle management: post_init, post_shutdown, create_bot.
 
@@ -132,6 +134,8 @@ from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
 from .terminal_parser import extract_bash_output, is_interactive_ui
 from .tmux_manager import tmux_manager
+from .transcribe import close_client as close_transcribe_client
+from .transcribe import transcribe_voice
 from .utils import ccbot_dir
 
 logger = logging.getLogger(__name__)
@@ -538,7 +542,7 @@ async def unsupported_content_handler(
     update: Update,
     _context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Reply to non-text messages (images, stickers, voice, etc.)."""
+    """Reply to non-text messages (stickers, video, etc.)."""
     if not update.message:
         return
     user = update.effective_user
@@ -547,7 +551,7 @@ async def unsupported_content_handler(
     logger.debug("Unsupported content from user %d", user.id)
     await safe_reply(
         update.message,
-        "⚠ Only text messages are supported. Images, stickers, voice, and other media cannot be forwarded to Claude Code.",
+        "⚠ Only text, photo, and voice messages are supported. Stickers, video, and other media cannot be forwarded to Claude Code.",
     )
 
 
@@ -625,6 +629,82 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     # Confirm to user
     await safe_reply(update.message, "📷 Image sent to Claude Code.")
+
+
+async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle voice messages: transcribe via OpenAI and forward text to Claude Code."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        if update.message:
+            await safe_reply(update.message, "You are not authorized to use this bot.")
+        return
+
+    if not update.message or not update.message.voice:
+        return
+
+    if not config.openai_api_key:
+        await safe_reply(
+            update.message,
+            "⚠ Voice transcription requires an OpenAI API key.\n"
+            "Set `OPENAI_API_KEY` in your `.env` file and restart the bot.",
+        )
+        return
+
+    chat = update.message.chat
+    thread_id = _get_thread_id(update)
+    if chat.type in ("group", "supergroup") and thread_id is not None:
+        session_manager.set_group_chat_id(user.id, thread_id, chat.id)
+
+    if thread_id is None:
+        await safe_reply(
+            update.message,
+            "❌ Please use a named topic. Create a new topic to start a session.",
+        )
+        return
+
+    wid = session_manager.get_window_for_thread(user.id, thread_id)
+    if wid is None:
+        await safe_reply(
+            update.message,
+            "❌ No session bound to this topic. Send a text message first to create one.",
+        )
+        return
+
+    w = await tmux_manager.find_window_by_id(wid)
+    if not w:
+        display = session_manager.get_display_name(wid)
+        session_manager.unbind_thread(user.id, thread_id)
+        await safe_reply(
+            update.message,
+            f"❌ Window '{display}' no longer exists. Binding removed.\n"
+            "Send a message to start a new session.",
+        )
+        return
+
+    # Download voice as in-memory bytes
+    voice_file = await update.message.voice.get_file()
+    ogg_data = bytes(await voice_file.download_as_bytearray())
+
+    # Transcribe
+    try:
+        text = await transcribe_voice(ogg_data)
+    except ValueError as e:
+        await safe_reply(update.message, f"⚠ {e}")
+        return
+    except Exception as e:
+        logger.error("Voice transcription failed: %s", e)
+        await safe_reply(update.message, f"⚠ Transcription failed: {e}")
+        return
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+    clear_status_msg_info(user.id, thread_id)
+
+    success, message = await session_manager.send_to_window(wid, text)
+    if not success:
+        await safe_reply(update.message, f"❌ {message}")
+        return
+
+    await safe_reply(update.message, f'🎤 "{text}"')
 
 
 # Active bash capture tasks: (user_id, thread_id) → asyncio.Task
@@ -1774,6 +1854,8 @@ async def post_shutdown(application: Application) -> None:
         session_monitor.stop()
         logger.info("Session monitor stopped")
 
+    await close_transcribe_client()
+
 
 def create_bot() -> Application:
     application = (
@@ -1813,7 +1895,9 @@ def create_bot() -> Application:
     )
     # Photos: download and forward file path to Claude Code
     application.add_handler(MessageHandler(filters.PHOTO, photo_handler))
-    # Catch-all: non-text content (stickers, voice, etc.)
+    # Voice: transcribe via OpenAI and forward text to Claude Code
+    application.add_handler(MessageHandler(filters.VOICE, voice_handler))
+    # Catch-all: non-text content (stickers, video, etc.)
     application.add_handler(
         MessageHandler(
             ~filters.COMMAND & ~filters.TEXT & ~filters.StatusUpdate.ALL,
