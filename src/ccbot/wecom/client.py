@@ -235,6 +235,21 @@ class WeComClient:
             },
         )
 
+    async def download_media(self, media_id: str) -> bytes:
+        """Download media from WeCom by media_id."""
+        token = await self.get_access_token()
+        resp = await self._http.get(
+            f"{BASE_URL}/media/get",
+            params={"access_token": token, "media_id": media_id},
+            follow_redirects=True,
+        )
+        # If response is JSON, it's an error
+        content_type = resp.headers.get("content-type", "")
+        if "json" in content_type:
+            data = resp.json()
+            raise RuntimeError(f"Failed to download media: {data}")
+        return resp.content
+
     async def upload_media(self, media_type: str, data: bytes, filename: str) -> str:
         """Upload media to WeCom and return media_id."""
         token = await self.get_access_token()

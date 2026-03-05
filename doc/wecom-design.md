@@ -274,6 +274,19 @@ class ToolCollector:
 
 注意：企微不支持 `/` 前缀的命令自动补全，用户需要手动输入完整命令。
 
+### 语音消息
+
+支持语音消息输入，流程：
+1. 接收企微语音消息（AMR 格式）
+2. 通过企微 API 下载语音文件
+3. ffmpeg 转换 AMR → MP3（OpenAI 不支持 AMR）
+4. 调用 OpenAI gpt-4o-transcribe 转文字
+5. 回显转写文本（`🎤 xxx`），然后作为普通文本发给 Claude
+
+需要：
+- 服务器安装 `ffmpeg`：`apt install ffmpeg`
+- `.env` 配置 `OPENAI_API_KEY`（可选配 `OPENAI_BASE_URL`）
+
 ### 会话恢复
 
 `/bind` 绑定目录时，如果该目录下存在已有的 Claude 会话，会展示会话列表供用户选择恢复或新建：
@@ -398,6 +411,10 @@ WECOM_LISTEN_HOST=0.0.0.0     # 监听地址，默认 0.0.0.0
 WECOM_LISTEN_PORT=8080         # 监听端口，默认 8080
 WECOM_ALLOWED_USERS=zhangsan,lisi  # 允许使用的用户ID，留空则不限制
 
+# 语音转文字（可选，需要 ffmpeg）
+OPENAI_API_KEY=your_openai_api_key
+# OPENAI_BASE_URL=https://api.openai.com/v1
+
 # 共享配置
 TMUX_SESSION_NAME=ccbot
 CLAUDE_COMMAND=claude
@@ -421,6 +438,9 @@ CLAUDE_COMMAND=claude
 ### 第七步：启动
 
 ```bash
+# 安装系统依赖（语音转文字需要）
+apt install ffmpeg
+
 # 安装 wecom 依赖
 uv sync --extra wecom
 

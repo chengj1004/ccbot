@@ -291,7 +291,14 @@ class WeComBot:
                 (content or "")[:80],
             )
 
-            if msg_type == "text" and content:
+            if msg_type == "voice":
+                media_id = root.findtext("MediaId", "")
+                if media_id and self.wc.is_user_allowed(from_user):
+                    asyncio.create_task(
+                        self._handle_voice_message(chat_id, from_user, media_id)
+                    )
+
+            elif msg_type == "text" and content:
                 # Check user permission
                 if not self.wc.is_user_allowed(from_user):
                     logger.warning("Unauthorized user: %s", from_user)
@@ -376,6 +383,48 @@ class WeComBot:
                 )
             if not success:
                 await self._send_text(chat_id, f"发送失败: {msg}")
+
+    async def _handle_voice_message(
+        self, chat_id: str, userid: str, media_id: str
+    ) -> None:
+        """Download voice, convert AMR→MP3, transcribe, and process as text."""
+        try:
+            amr_data = await self.client.download_media(media_id)
+        except Exception as e:
+            logger.error("Failed to download voice: %s", e)
+            await self._send_text(chat_id, f"语音下载失败: {e}")
+            return
+
+        # Convert AMR to MP3 via ffmpeg (OpenAI doesn't support AMR)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-i", "pipe:0", "-f", "mp3", "pipe:1",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            mp3_data, stderr = await proc.communicate(amr_data)
+            if proc.returncode != 0:
+                raise RuntimeError(f"ffmpeg error: {stderr.decode()[:200]}")
+        except Exception as e:
+            logger.error("Failed to convert voice: %s", e)
+            await self._send_text(chat_id, f"语音转换失败: {e}")
+            return
+
+        try:
+            from ..transcribe import transcribe_voice
+
+            text = await transcribe_voice(
+                mp3_data, filename="voice.mp3", mime_type="audio/mpeg"
+            )
+        except Exception as e:
+            logger.error("Failed to transcribe voice: %s", e)
+            await self._send_text(chat_id, f"语音转文字失败: {e}")
+            return
+
+        logger.info("Voice transcribed for %s: %s", userid, text[:80])
+        await self._send_text(chat_id, f"🎤 {text}")
+        await self._handle_text_message(chat_id, userid, text)
 
     async def _handle_command(self, chat_id: str, userid: str, text: str) -> None:
         """Handle a slash command in a group."""
