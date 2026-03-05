@@ -10,7 +10,10 @@ Key class: WeComConfig.
 import json
 import logging
 import os
+from pathlib import Path
 from dataclasses import dataclass
+
+from dotenv import load_dotenv
 
 from ..utils import atomic_write_json, ccbot_dir
 
@@ -32,6 +35,14 @@ class WeComConfig:
 
     def __init__(self) -> None:
         self.config_dir = ccbot_dir()
+
+        # Load .env (same priority as shared Config: local > config dir)
+        local_env = Path(".env")
+        global_env = self.config_dir / ".env"
+        if local_env.is_file():
+            load_dotenv(local_env)
+        if global_env.is_file():
+            load_dotenv(global_env)
 
         # WeCom API credentials
         self.corp_id: str = os.getenv("WECOM_CORP_ID", "")

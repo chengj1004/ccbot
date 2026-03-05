@@ -18,7 +18,6 @@ import time
 import xml.etree.ElementTree as ET
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.padding import PKCS7
 
 
 class WeComCrypto:
@@ -49,9 +48,11 @@ class WeComCrypto:
         decryptor = cipher.decryptor()
         decrypted = decryptor.update(base64.b64decode(encrypted)) + decryptor.finalize()
 
-        # Remove PKCS7 padding
-        unpadder = PKCS7(128).unpadder()
-        decrypted = unpadder.update(decrypted) + unpadder.finalize()
+        # Remove PKCS#7 padding (32-byte block size, not 16)
+        pad_val = decrypted[-1]
+        if pad_val < 1 or pad_val > 32:
+            raise ValueError(f"Invalid padding value: {pad_val}")
+        decrypted = decrypted[:-pad_val]
 
         # Parse: 16 bytes random + 4 bytes msg_len + msg + corp_id
         msg_len = struct.unpack("!I", decrypted[16:20])[0]
@@ -75,9 +76,9 @@ class WeComCrypto:
         msg_len = struct.pack("!I", len(msg_bytes))
         plaintext = random_bytes + msg_len + msg_bytes + self.corp_id.encode()
 
-        # PKCS7 padding
-        padder = PKCS7(128).padder()
-        padded = padder.update(plaintext) + padder.finalize()
+        # Pad to 32-byte alignment (WeCom convention)
+        pad_len = 32 - (len(plaintext) % 32)
+        padded = plaintext + b" " * pad_len
 
         cipher = Cipher(algorithms.AES(self.aes_key), modes.CBC(self.iv))
         encryptor = cipher.encryptor()

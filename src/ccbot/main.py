@@ -74,15 +74,8 @@ def _run_telegram() -> None:
 
 def _run_wecom() -> None:
     """Start the WeCom bot."""
-    try:
-        from .config import config  # noqa: F841 — triggers shared config init
-    except ValueError as e:
-        print(f"Config error: {e}")
-        sys.exit(1)
-
-    logging.getLogger("ccbot").setLevel(logging.DEBUG)
-    logger = logging.getLogger(__name__)
-
+    # WeComConfig must be created BEFORE importing shared config,
+    # because Config.__init__ scrubs WECOM_* sensitive env vars.
     try:
         from .wecom.config import WeComConfig
 
@@ -101,6 +94,16 @@ def _run_wecom() -> None:
         print("  WECOM_CALLBACK_TOKEN=your_callback_token")
         print("  WECOM_ENCODING_AES_KEY=your_encoding_aes_key")
         sys.exit(1)
+
+    # Now safe to init shared config (env vars already captured above)
+    try:
+        from .config import config  # noqa: F841 — triggers shared config init
+    except ValueError as e:
+        print(f"Config error: {e}")
+        sys.exit(1)
+
+    logging.getLogger("ccbot").setLevel(logging.DEBUG)
+    logger = logging.getLogger(__name__)
 
     from .tmux_manager import tmux_manager
 

@@ -6,17 +6,21 @@
 
 ## 核心设计决策
 
-### 1. 群聊隔离（1 群 = 1 Window = 1 Session）
+### 1. 群聊/单聊隔离（1 会话 = 1 Window = 1 Session）
 
-用企微群聊替代 Telegram Forum Topic 作为路由单元：
+支持两种路由模式：
+- **群聊**：用企微群聊 chatid 作为路由键
+- **单聊**：用 `dm:{userid}` 作为虚拟 chatid，直接给应用发消息即可
 
 ```
 ┌─────────────┐      ┌─────────────┐      ┌─────────────┐
-│  群聊 chatid │ ───▶ │ Window ID   │ ───▶ │ Session ID  │
-│  (WeCom)    │      │ (tmux @id)  │      │  (Claude)   │
+│  群聊 chatid │      │             │      │             │
+│  (WeCom)    │ ───▶ │ Window ID   │ ───▶ │ Session ID  │
+│  dm:userid  │      │ (tmux @id)  │      │  (Claude)   │
+│  (单聊)     │      │             │      │             │
 └─────────────┘      └─────────────┘      └─────────────┘
    wecom_groups.json      session_map.json
-   + wecom_state.json     (written by hook)
+                          (written by hook)
 ```
 
 ### 2. 群→目录映射
@@ -81,7 +85,8 @@ Bot 收到群消息时，如果群未绑定且无配置，则提示使用 `/bind
 | 特性 | Telegram | WeCom |
 |---|---|---|
 | 路由单元 | Forum Topic (thread_id) | 群聊 (chatid) |
-| 消息格式 | MarkdownV2 (严格转义) | Markdown (企微简化版) |
+| 单聊支持 | 无 (Topic-only) | 支持 (dm:{userid}) |
+| 消息格式 | MarkdownV2 (严格转义) | Markdown (企微简化版，自动转换) |
 | 消息编辑 | edit_message_text | 不支持（模板卡片除外） |
 | 单条限制 | 4096 字符 | 2048 字节 (text) |
 | 交互按钮 | InlineKeyboard | 模板卡片 button_list |
@@ -265,8 +270,41 @@ class ToolCollector:
 | `/esc` | 发送 Escape 中断 Claude |
 | `/kill` | 终止 Claude 进程 |
 | `/history` | 查看消息历史 (纯文本) |
+| `/file <path>` | 发送文件到聊天 (支持相对/绝对路径) |
 
 注意：企微不支持 `/` 前缀的命令自动补全，用户需要手动输入完整命令。
+
+### 会话恢复
+
+`/bind` 绑定目录时，如果该目录下存在已有的 Claude 会话，会展示会话列表供用户选择恢复或新建：
+
+```
+发现已有会话，回复数字恢复或输入 0 新建:
+
+1. 上次的对话摘要 — 42 条消息
+2. 更早的对话 — 15 条消息
+
+0. 新建会话
+```
+
+发消息时如果窗口已关闭，也会触发同样的会话选择流程，选择后原消息自动转发。
+
+`--resume` 模式下，hook 会报告新的 session_id，但消息实际写入原 JSONL 文件。bot 会将 window_state 的 session_id 覆盖回原始值，确保 monitor 跟踪正确的文件。
+
+### 文件自动发送
+
+当 Claude 的回复文本中提到文档文件路径（绝对路径）且文件存在时，bot 自动上传并发送文件。同时也监听 `Write` 工具创建的文档文件。
+
+支持的文件类型：`.docx` `.pdf` `.xlsx` `.csv` `.pptx` `.zip` `.md` `.txt` `.json` `.yaml` 等。
+
+也可通过 `/file <path>` 手动发送任意文件（20MB 以内）。
+
+### Markdown 转换
+
+所有消息通过 `_to_wecom_markdown()` 转换后以 markdown 消息类型发送：
+- `# 标题` → `**标题**`（企微不支持标题语法）
+- 代码块 → `> ` 引用格式（企微不支持围栏代码块）
+- 加粗、链接、行内代码、引用等保持原样
 
 ## CLI 入口
 
@@ -323,33 +361,19 @@ wecom = [
 > # 拿到的 https://xxxx.ngrok.io/callback 填入企微后台
 > ```
 
-### 第四步：创建应用群聊
+### 第四步：使用方式
 
-ccbot 通过 **应用群聊** 收发消息（`/cgi-bin/appchat/send` API）。创建方式有两种：
+支持两种使用方式：
 
-**方式 A：通过 API 创建（推荐）**
+**方式 A：单聊（推荐）**
 
-```bash
-# 先获取 access_token
-TOKEN=$(curl -s "https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=YOUR_CORP_ID&corpsecret=YOUR_SECRET" | jq -r .access_token)
+直接在企业微信中找到你的应用，发送 `/bind /path/to/project` 即可。无需创建群聊。
 
-# 创建群聊
-curl -s "https://qyapi.weixin.qq.com/cgi-bin/appchat/create?access_token=$TOKEN" \
-  -d '{
-    "name": "ccbot-项目名",
-    "owner": "your_userid",
-    "userlist": ["your_userid"],
-    "chatid": "ccbot_project1"
-  }' | jq .
-```
+**方式 B：群聊**
 
-返回的 `chatid` 就是群聊 ID，填入 `wecom_groups.json`。
+通过 API 创建应用群聊，或在已有群聊中使用 `/bind` 命令。
 
-> 注意：应用群聊至少需要 2 个成员才能创建。如果只有一个人，可以先拉一个同事进来，创建后再移除。
-
-**方式 B：群内使用 /bind 命令**
-
-如果你已有群聊并且应用已加入该群，直接在群里发 `/bind /path/to/project` 即可。但需要先知道群的 chatid（可以通过接收消息回调日志查看）。
+> 注意：应用群聊至少需要 2 个成员才能创建。
 
 ### 第五步：配置应用可信域名（可选）
 
@@ -440,13 +464,16 @@ ccbot wecom
 - 确保 URL 是 HTTPS（企微要求）
 - 检查 Token 和 EncodingAESKey 是否复制正确（不要有多余空格）
 
-**Q: 消息发不到群里？**
-- 确认使用的是 **应用群聊**（通过 API 创建），不是普通群聊
+**Q: 消息发不到群里/单聊？**
 - 确认应用的 Secret 正确
-- 检查 `wecom_groups.json` 中的 chatid 是否匹配
+- 确认服务器出口 IP 已加入企微后台的 **企业可信IP** 白名单
+- 群聊模式下，确认使用的是 **应用群聊**（通过 API 创建），不是普通群聊
 
-**Q: 群里发消息 bot 没反应？**
-- 确认应用已添加到群聊中
+**Q: 消息解密失败 (Invalid padding bytes)？**
+- 确认 `.env` 中的 `WECOM_CALLBACK_TOKEN` 和 `WECOM_ENCODING_AES_KEY` 与企微后台一致
+- 修改后需要重启 bot
+
+**Q: 发消息 bot 没反应？**
 - 确认 `WECOM_ALLOWED_USERS` 为空（不限制）或包含你的 userid
 - 查看 ccbot 日志确认是否收到 webhook 回调
 
