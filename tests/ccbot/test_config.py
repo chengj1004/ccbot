@@ -46,13 +46,15 @@ class TestConfigValid:
 class TestConfigMissingEnv:
     def test_missing_telegram_bot_token(self, monkeypatch):
         monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+        cfg = Config()
         with pytest.raises(ValueError, match="TELEGRAM_BOT_TOKEN"):
-            Config()
+            cfg.validate_telegram()
 
     def test_missing_allowed_users(self, monkeypatch):
         monkeypatch.delenv("ALLOWED_USERS", raising=False)
+        cfg = Config()
         with pytest.raises(ValueError, match="ALLOWED_USERS"):
-            Config()
+            cfg.validate_telegram()
 
     def test_non_numeric_allowed_users(self, monkeypatch):
         monkeypatch.setenv("ALLOWED_USERS", "abc")
