@@ -86,9 +86,25 @@ def _to_wecom_markdown(text: str) -> str:
 
 # File extensions that should be auto-sent when Claude writes them
 _DOCUMENT_EXTENSIONS = {
-    ".docx", ".doc", ".pdf", ".xlsx", ".xls", ".csv",
-    ".pptx", ".ppt", ".zip", ".tar", ".gz", ".7z",
-    ".md", ".txt", ".json", ".yaml", ".yml",
+    ".docx",
+    ".doc",
+    ".pdf",
+    ".xlsx",
+    ".xls",
+    ".csv",
+    ".pptx",
+    ".ppt",
+    ".zip",
+    ".tar",
+    ".gz",
+    ".7z",
+    ".html",
+    ".htm",
+    ".md",
+    ".txt",
+    ".json",
+    ".yaml",
+    ".yml",
 }
 
 
@@ -174,9 +190,7 @@ class WeComBot:
         """Send content as markdown to either a user (DM) or group chat."""
         md = _to_wecom_markdown(content)
         if self._is_dm(chat_id):
-            return await self.client.send_markdown_to_user(
-                self._dm_userid(chat_id), md
-            )
+            return await self.client.send_markdown_to_user(self._dm_userid(chat_id), md)
         return await self.client.send_markdown(chat_id, md)
 
     async def _send_file(self, chat_id: str, media_id: str) -> dict:
@@ -298,6 +312,20 @@ class WeComBot:
                         self._handle_voice_message(chat_id, from_user, media_id)
                     )
 
+            elif msg_type in ("file", "image"):
+                media_id = root.findtext("MediaId", "")
+                file_name = root.findtext("FileName", "")
+                if media_id and self.wc.is_user_allowed(from_user):
+                    asyncio.create_task(
+                        self._handle_file_message(
+                            chat_id,
+                            from_user,
+                            media_id,
+                            file_name
+                            or ("image.jpg" if msg_type == "image" else "file"),
+                        )
+                    )
+
             elif msg_type == "text" and content:
                 # Check user permission
                 if not self.wc.is_user_allowed(from_user):
@@ -398,7 +426,12 @@ class WeComBot:
         # Convert AMR to MP3 via ffmpeg (OpenAI doesn't support AMR)
         try:
             proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-i", "pipe:0", "-f", "mp3", "pipe:1",
+                "ffmpeg",
+                "-i",
+                "pipe:0",
+                "-f",
+                "mp3",
+                "pipe:1",
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -425,6 +458,50 @@ class WeComBot:
         logger.info("Voice transcribed for %s: %s", userid, text[:80])
         await self._send_text(chat_id, f"🎤 {text}")
         await self._handle_text_message(chat_id, userid, text)
+
+    async def _handle_file_message(
+        self, chat_id: str, userid: str, media_id: str, file_name: str
+    ) -> None:
+        """Download file from WeCom, save to working directory, and notify Claude."""
+        binding = self.wc.groups.get(chat_id)
+        if not binding or not binding.cwd:
+            await self._send_text(chat_id, "未绑定工作目录，无法接收文件。")
+            return
+
+        try:
+            data = await self.client.download_media(media_id)
+        except Exception as e:
+            logger.error("Failed to download file: %s", e)
+            await self._send_text(chat_id, f"文件下载失败: {e}")
+            return
+
+        # Save to uploads/ subdirectory under working directory
+        save_dir = Path(binding.cwd) / "uploads"
+        save_dir.mkdir(exist_ok=True)
+        save_path = save_dir / file_name
+        # Avoid overwriting: add suffix if file exists
+        if save_path.exists():
+            stem = save_path.stem
+            suffix = save_path.suffix
+            i = 1
+            while save_path.exists():
+                save_path = save_dir / f"{stem}_{i}{suffix}"
+                i += 1
+
+        try:
+            save_path.write_bytes(data)
+        except Exception as e:
+            logger.error("Failed to save file %s: %s", save_path, e)
+            await self._send_text(chat_id, f"文件保存失败: {e}")
+            return
+
+        logger.info("Saved file %s (%d bytes) for %s", save_path, len(data), userid)
+        await self._send_text(chat_id, f"文件已保存: `{save_path.name}`")
+
+        # Notify Claude about the file
+        if binding.window_id:
+            msg = f"用户发送了文件，已保存到: {save_path}"
+            await session_manager.send_to_window(binding.window_id, msg)
 
     async def _handle_command(self, chat_id: str, userid: str, text: str) -> None:
         """Handle a slash command in a group."""
@@ -479,7 +556,10 @@ class WeComBot:
             self.wc.groups[chat_id] = binding
             self.wc.save_groups()
 
-            lines = [f"**已绑定到 {path}**\n", "发现已有会话，回复数字恢复或输入 0 新建:\n"]
+            lines = [
+                f"**已绑定到 {path}**\n",
+                "发现已有会话，回复数字恢复或输入 0 新建:\n",
+            ]
             for i, s in enumerate(sessions):
                 summary = s.summary[:40] + "…" if len(s.summary) > 40 else s.summary
                 lines.append(f"**{i + 1}.** {summary} — {s.message_count} 条消息")
@@ -617,7 +697,9 @@ class WeComBot:
         # 20MB limit for WeCom file upload
         size = file_path.stat().st_size
         if size > 20 * 1024 * 1024:
-            await self._send_text(chat_id, f"文件过大 ({size // 1024 // 1024}MB)，限制20MB")
+            await self._send_text(
+                chat_id, f"文件过大 ({size // 1024 // 1024}MB)，限制20MB"
+            )
             return
 
         try:
@@ -648,9 +730,7 @@ class WeComBot:
             await self._send_text(chat_id, "新建会话...")
         else:
             selected = sessions[choice - 1]
-            await self._send_text(
-                chat_id, f"恢复会话: {selected.summary[:50]}"
-            )
+            await self._send_text(chat_id, f"恢复会话: {selected.summary[:50]}")
             resume_id = selected.session_id
 
         await self._ensure_window(chat_id, binding, resume_session_id=resume_id)
@@ -799,7 +879,9 @@ class WeComBot:
 
         size = p.stat().st_size
         if size > 20 * 1024 * 1024:
-            await self._send_text(chat_id, f"文件过大无法自动发送: {p.name} ({size // 1024 // 1024}MB)")
+            await self._send_text(
+                chat_id, f"文件过大无法自动发送: {p.name} ({size // 1024 // 1024}MB)"
+            )
             return
 
         try:
