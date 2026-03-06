@@ -308,9 +308,13 @@ class ToolCollector:
 
 当 Claude 的回复文本中提到文档文件路径（绝对路径）且文件存在时，bot 自动上传并发送文件。同时也监听 `Write` 工具创建的文档文件。
 
-支持的文件类型：`.docx` `.pdf` `.xlsx` `.csv` `.pptx` `.zip` `.md` `.txt` `.json` `.yaml` 等。
+支持的文件类型：`.docx` `.pdf` `.xlsx` `.csv` `.pptx` `.zip` `.html` `.htm` `.md` `.txt` `.json` `.yaml` 等。
 
 也可通过 `/file <path>` 手动发送任意文件（20MB 以内）。
+
+### 接收用户文件
+
+用户在聊天中发送文件或图片时，bot 自动下载并保存到绑定目录的 `uploads/` 子目录下，然后通知 Claude 文件已保存。同名文件自动加后缀避免覆盖。
 
 ### Markdown 转换
 
@@ -419,6 +423,43 @@ OPENAI_API_KEY=your_openai_api_key
 TMUX_SESSION_NAME=ccbot
 CLAUDE_COMMAND=claude
 ```
+
+### API 模式（可选）
+
+如果希望企微启动的 Claude Code 通过 API 代理而非 Max 订阅运行，可以使用独立配置目录：
+
+1. 创建 `~/.claude-wecom/` 目录
+2. 创建 `~/.claude-wecom/settings.json`：
+   ```json
+   {
+       "env": {
+           "ANTHROPIC_BASE_URL": "http://your-proxy:6666",
+           "ANTHROPIC_AUTH_TOKEN": "your-api-token"
+       },
+       "hooks": {
+           "SessionStart": [
+               {
+                   "hooks": [
+                       {
+                           "type": "command",
+                           "command": "/path/to/ccbot hook",
+                           "timeout": 5
+                       }
+                   ]
+               }
+           ]
+       },
+       "skipDangerousModePermissionPrompt": true
+   }
+   ```
+3. 创建 `~/.claude-wecom/.claude.json`，确保包含 `"hasCompletedOnboarding": true`
+4. 符号链接 projects 目录：`ln -sf ~/.claude/projects ~/.claude-wecom/projects`
+5. 在 `.env` 中设置：
+   ```
+   CLAUDE_COMMAND=env CLAUDE_CONFIG_DIR=~/.claude-wecom claude --dangerously-skip-permissions
+   ```
+
+这样企微的 Claude Code 走 API 代理，而你本地的 Claude Code 继续用 Max 订阅，互不影响。
 
 配置群聊绑定 `~/.ccbot/wecom_groups.json`：
 

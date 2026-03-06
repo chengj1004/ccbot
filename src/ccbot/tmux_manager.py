@@ -92,6 +92,13 @@ class TmuxManager:
             except Exception:
                 pass  # var not set in session env — nothing to remove
 
+    async def set_environment(self, var: str, value: str) -> None:
+        """Set an environment variable in the tmux session."""
+        session = self.get_or_create_session()
+        await asyncio.get_event_loop().run_in_executor(
+            None, session.set_environment, var, value
+        )
+
     async def list_windows(self) -> list[TmuxWindow]:
         """List all windows in the session with their working directories.
 
