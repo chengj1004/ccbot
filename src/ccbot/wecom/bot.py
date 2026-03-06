@@ -16,7 +16,6 @@ Key function: run_wecom_bot().
 
 import asyncio
 import logging
-import os
 import re
 import uuid
 import xml.etree.ElementTree as ET
@@ -1006,12 +1005,6 @@ class WeComBot:
 
     async def start(self) -> None:
         """Initialize monitor, restore window bindings, start background tasks."""
-        # Inject ANTHROPIC_* env vars into tmux session so new windows inherit them
-        for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"):
-            val = os.environ.get(var)
-            if val:
-                await tmux_manager.set_environment(var, val)
-
         # Resolve stale window IDs
         await session_manager.resolve_stale_ids()
 
