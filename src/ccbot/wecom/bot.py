@@ -304,6 +304,7 @@ class WeComBot:
                 msg_type,
                 (content or "")[:80],
             )
+            logger.debug("Decrypted XML: %s", xml_content[:500])
 
             if msg_type == "voice":
                 media_id = root.findtext("MediaId", "")
@@ -395,6 +396,8 @@ class WeComBot:
             if not binding.window_id:
                 await self._send_text(chat_id, "创建窗口失败")
                 return
+            # Wait briefly for Claude Code to initialize before sending
+            await asyncio.sleep(2)
 
         # Send text to tmux window
         success, msg = await session_manager.send_to_window(binding.window_id, text)
