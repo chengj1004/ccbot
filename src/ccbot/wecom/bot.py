@@ -801,6 +801,7 @@ class WeComBot:
                 chat_id,
                 binding.cwd,
             )
+            self.wc.save_groups()
         else:
             logger.error("Failed to create window for group %s: %s", chat_id, msg)
 
@@ -811,6 +812,11 @@ class WeComBot:
         # Find which group chat this session belongs to
         chat_id = self._find_chatid_for_session(msg.session_id)
         if not chat_id:
+            logger.debug(
+                "No chatid for session %s (groups: %s)",
+                msg.session_id,
+                {k: v.window_id for k, v in self.wc.groups.items()},
+            )
             return
 
         binding = self.wc.groups.get(chat_id)
@@ -897,19 +903,20 @@ class WeComBot:
 
     def _find_chatid_for_session(self, session_id: str) -> str | None:
         """Reverse lookup: session_id → window_id → chatid."""
-        # Find window_id from session_manager's window_states
-        target_wid: str | None = None
-        for wid, ws in session_manager.window_states.items():
-            if ws.session_id == session_id:
-                target_wid = wid
-                break
+        # Collect all window_ids matching this session_id
+        # (multiple may exist if windows were recreated via unbind/bind)
+        matching_wids: list[str] = [
+            wid
+            for wid, ws in session_manager.window_states.items()
+            if ws.session_id == session_id
+        ]
 
-        if not target_wid:
+        if not matching_wids:
             return None
 
-        # Find chatid from group bindings
+        # Find chatid from group bindings, preferring bound window_ids
         for chat_id, binding in self.wc.groups.items():
-            if binding.window_id == target_wid:
+            if binding.window_id in matching_wids:
                 return chat_id
 
         return None
@@ -1024,27 +1031,42 @@ class WeComBot:
     async def _restore_bindings(self) -> None:
         """Restore window_ids for group bindings by matching against live windows."""
         windows = await tmux_manager.list_windows()
-        name_to_id = {w.window_name: w.window_id for w in windows}
+        live_ids = {w.window_id for w in windows}
+        # Build name→id map, but track used IDs to avoid duplicates
+        name_to_ids: dict[str, list[str]] = {}
+        for w in windows:
+            name_to_ids.setdefault(w.window_name, []).append(w.window_id)
+        used_ids: set[str] = set()
 
         for chat_id, binding in self.wc.groups.items():
             if binding.window_id:
-                # Check if window still exists
-                w = await tmux_manager.find_window_by_id(binding.window_id)
-                if w:
+                if binding.window_id in live_ids:
+                    used_ids.add(binding.window_id)
                     continue
-                # Window gone, try by name
+                # Window gone
+                logger.info(
+                    "Window %s gone for group %s, will re-match",
+                    binding.window_id,
+                    chat_id,
+                )
                 binding.window_id = ""
 
-            # Try to match by directory name
+            # Try to match by directory name, picking first unused
             dir_name = Path(binding.cwd).name if binding.cwd else ""
-            if dir_name and dir_name in name_to_id:
-                binding.window_id = name_to_id[dir_name]
-                logger.info(
-                    "Restored window for group %s: %s -> %s",
-                    chat_id,
-                    dir_name,
-                    binding.window_id,
-                )
+            if dir_name:
+                for wid in name_to_ids.get(dir_name, []):
+                    if wid not in used_ids:
+                        binding.window_id = wid
+                        used_ids.add(wid)
+                        logger.info(
+                            "Restored window for group %s: %s -> %s",
+                            chat_id,
+                            dir_name,
+                            binding.window_id,
+                        )
+                        break
+        # Persist restored window_ids
+        self.wc.save_groups()
 
     async def shutdown(self) -> None:
         """Clean shutdown."""

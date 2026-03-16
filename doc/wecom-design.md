@@ -424,11 +424,36 @@ TMUX_SESSION_NAME=ccbot
 CLAUDE_COMMAND=claude
 ```
 
-### API 模式（可选）
+### 运行模式切换
 
-如果希望企微启动的 Claude Code 通过 API 代理而非 Max 订阅运行，可以使用独立配置目录：
+企微启动的 Claude Code 支持两种运行模式，通过 `.env` 中的 `CLAUDE_COMMAND` 切换：
 
-1. 创建 `~/.claude-wecom/` 目录
+**模式 A：默认订阅模式**
+
+使用你本地登录的 Claude Max/Pro 订阅额度：
+
+```env
+CLAUDE_COMMAND=claude --dangerously-skip-permissions
+```
+
+优点：配置简单，无需额外搭建。缺点：与本地使用共享订阅额度。
+
+**模式 B：API 代理模式**
+
+通过独立的 API 代理运行，与本地订阅完全隔离：
+
+```env
+CLAUDE_COMMAND=env CLAUDE_CONFIG_DIR=~/.claude-wecom claude --dangerously-skip-permissions
+```
+
+可在末尾追加 system prompt 限制操作范围：
+```env
+CLAUDE_COMMAND=env CLAUDE_CONFIG_DIR=~/.claude-wecom claude --dangerously-skip-permissions --append-system-prompt "你只能操作当前工作目录下的文件，禁止读写或访问其他项目目录。"
+```
+
+API 代理模式需要额外配置：
+
+1. 创建独立配置目录 `~/.claude-wecom/`
 2. 创建 `~/.claude-wecom/settings.json`：
    ```json
    {
@@ -454,12 +479,10 @@ CLAUDE_COMMAND=claude
    ```
 3. 创建 `~/.claude-wecom/.claude.json`，确保包含 `"hasCompletedOnboarding": true`
 4. 符号链接 projects 目录：`ln -sf ~/.claude/projects ~/.claude-wecom/projects`
-5. 在 `.env` 中设置：
-   ```
-   CLAUDE_COMMAND=env CLAUDE_CONFIG_DIR=~/.claude-wecom claude --dangerously-skip-permissions
-   ```
 
-这样企微的 Claude Code 走 API 代理，而你本地的 Claude Code 继续用 Max 订阅，互不影响。
+这样企微的 Claude Code 走 API 代理计费，本地的 Claude Code 继续用订阅，互不影响。
+
+> **切换模式后**：需要重启 ccbot wecom 服务，并对已绑定的会话执行 `/kill`，下次发消息时会用新模式重建窗口。
 
 配置群聊绑定 `~/.ccbot/wecom_groups.json`：
 

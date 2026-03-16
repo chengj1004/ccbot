@@ -80,6 +80,7 @@ class WeComConfig:
                 self.groups[chat_id] = GroupBinding(
                     cwd=info.get("cwd", ""),
                     name=info.get("name", ""),
+                    window_id=info.get("window_id", ""),
                     verbose=info.get("verbose", False),
                 )
             logger.info("Loaded %d WeCom group bindings", len(self.groups))
@@ -93,6 +94,8 @@ class WeComConfig:
             entry: dict[str, str | bool] = {"cwd": binding.cwd}
             if binding.name:
                 entry["name"] = binding.name
+            if binding.window_id:
+                entry["window_id"] = binding.window_id
             if binding.verbose:
                 entry["verbose"] = binding.verbose
             data[chat_id] = entry
