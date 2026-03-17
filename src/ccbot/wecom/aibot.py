@@ -111,7 +111,7 @@ class ToolCollector:
         count = len(self.tools)
         lines = "\n".join(f"• {t}" for t in self.tools)
         self.tools.clear()
-        return f"🔧 执行了 {count} 个工具:\n{lines}"
+        return f"🔧 {count} tool(s) executed:\n{lines}"
 
 
 @dataclass
@@ -266,7 +266,7 @@ class WeComAIBot:
                     )
             else:
                 await self._stream_reply(
-                    chatid, "语音消息需要配置 WECOM_CORP_ID 和 WECOM_SECRET"
+                    chatid, "Voice messages require WECOM_CORP_ID and WECOM_SECRET"
                 )
 
         elif msgtype == "image":
@@ -287,7 +287,7 @@ class WeComAIBot:
                     )
             else:
                 await self._stream_reply(
-                    chatid, "文件接收需要配置 WECOM_CORP_ID 和 WECOM_SECRET"
+                    chatid, "File receiving requires WECOM_CORP_ID and WECOM_SECRET"
                 )
 
         elif msgtype == "mixed":
@@ -329,7 +329,7 @@ class WeComAIBot:
         binding = self.wc.groups.get(chatid)
         if not binding:
             await self._stream_reply(
-                chatid, "未绑定工作目录。请使用 /bind <目录路径> 命令绑定。"
+                chatid, "Not bound. Use /bind <path> to bind a working directory."
             )
             return
 
@@ -343,17 +343,19 @@ class WeComAIBot:
             if sessions:
                 self._pending_session_pick[chatid] = sessions
                 self._pending_messages[chatid] = text
-                lines = ["窗口已关闭，发现已有会话。回复数字恢复或输入 0 新建:\n"]
+                lines = [
+                    "Window closed. Existing sessions found. Reply with a number to resume or 0 for new:\n"
+                ]
                 for i, s in enumerate(sessions):
                     summary = s.summary[:40] + "…" if len(s.summary) > 40 else s.summary
-                    lines.append(f"**{i + 1}.** {summary} — {s.message_count} 条消息")
-                lines.append("\n**0.** 新建会话")
+                    lines.append(f"**{i + 1}.** {summary} — {s.message_count} messages")
+                lines.append("\n**0.** New session")
                 await self._stream_reply(chatid, "\n".join(lines))
                 return
 
             await self._ensure_window(chatid, binding)
             if not binding.window_id:
-                await self._stream_reply(chatid, "创建窗口失败")
+                await self._stream_reply(chatid, "Failed to create window")
                 return
             await asyncio.sleep(2)
 
@@ -372,7 +374,7 @@ class WeComAIBot:
                     binding.window_id, text
                 )
             if not success:
-                await self._update_stream(chatid, f"发送失败: {msg}")
+                await self._update_stream(chatid, f"Send failed: {msg}")
                 await self._finish_stream(chatid)
 
     # --- Media message handling ---
@@ -388,7 +390,7 @@ class WeComAIBot:
             amr_data = await self._media_client.download_media(media_id)
         except Exception as e:
             logger.error("Failed to download voice: %s", e)
-            await self._stream_reply(chatid, f"语音下载失败: {e}")
+            await self._stream_reply(chatid, f"Voice download failed: {e}")
             return
 
         try:
@@ -408,7 +410,7 @@ class WeComAIBot:
                 raise RuntimeError(f"ffmpeg error: {stderr.decode()[:200]}")
         except Exception as e:
             logger.error("Failed to convert voice: %s", e)
-            await self._stream_reply(chatid, f"语音转换失败: {e}")
+            await self._stream_reply(chatid, f"Voice conversion failed: {e}")
             return
 
         try:
@@ -419,7 +421,7 @@ class WeComAIBot:
             )
         except Exception as e:
             logger.error("Failed to transcribe voice: %s", e)
-            await self._stream_reply(chatid, f"语音转文字失败: {e}")
+            await self._stream_reply(chatid, f"Transcription failed: {e}")
             return
 
         logger.info("Voice transcribed for %s: %s", userid, text[:80])
@@ -432,7 +434,7 @@ class WeComAIBot:
         """Download image from URL, save to working directory, notify Claude."""
         binding = self.wc.groups.get(chatid)
         if not binding or not binding.cwd:
-            await self._stream_reply(chatid, "未绑定工作目录，无法接收图片。")
+            await self._stream_reply(chatid, "Not bound. Cannot receive images.")
             return
 
         try:
@@ -445,7 +447,7 @@ class WeComAIBot:
                     data = await resp.read()
         except Exception as e:
             logger.error("Failed to download image: %s", e)
-            await self._stream_reply(chatid, f"图片下载失败: {e}")
+            await self._stream_reply(chatid, f"Image download failed: {e}")
             return
 
         save_dir = Path(binding.cwd) / "uploads"
@@ -456,14 +458,14 @@ class WeComAIBot:
             save_path.write_bytes(data)
         except Exception as e:
             logger.error("Failed to save image: %s", e)
-            await self._stream_reply(chatid, f"图片保存失败: {e}")
+            await self._stream_reply(chatid, f"Image save failed: {e}")
             return
 
         logger.info("Saved image %s (%d bytes) for %s", save_path, len(data), userid)
-        await self._stream_reply(chatid, f"图片已保存: `{save_path.name}`")
+        await self._stream_reply(chatid, f"Image saved: `{save_path.name}`")
 
         if binding.window_id:
-            msg = f"用户发送了图片，已保存到: {save_path}"
+            msg = f"User sent an image, saved to: {save_path}"
             await session_manager.send_to_window(binding.window_id, msg)
 
     async def _handle_file_message(
@@ -475,14 +477,14 @@ class WeComAIBot:
 
         binding = self.wc.groups.get(chatid)
         if not binding or not binding.cwd:
-            await self._stream_reply(chatid, "未绑定工作目录，无法接收文件。")
+            await self._stream_reply(chatid, "Not bound. Cannot receive files.")
             return
 
         try:
             data = await self._media_client.download_media(media_id)
         except Exception as e:
             logger.error("Failed to download file: %s", e)
-            await self._stream_reply(chatid, f"文件下载失败: {e}")
+            await self._stream_reply(chatid, f"File download failed: {e}")
             return
 
         save_dir = Path(binding.cwd) / "uploads"
@@ -500,14 +502,14 @@ class WeComAIBot:
             save_path.write_bytes(data)
         except Exception as e:
             logger.error("Failed to save file %s: %s", save_path, e)
-            await self._stream_reply(chatid, f"文件保存失败: {e}")
+            await self._stream_reply(chatid, f"File save failed: {e}")
             return
 
         logger.info("Saved file %s (%d bytes) for %s", save_path, len(data), userid)
-        await self._stream_reply(chatid, f"文件已保存: `{save_path.name}`")
+        await self._stream_reply(chatid, f"File saved: `{save_path.name}`")
 
         if binding.window_id:
-            msg = f"用户发送了文件，已保存到: {save_path}"
+            msg = f"User sent a file, saved to: {save_path}"
             await session_manager.send_to_window(binding.window_id, msg)
 
     # --- Command handling ---
@@ -540,18 +542,18 @@ class WeComAIBot:
             if binding and binding.window_id:
                 await session_manager.send_to_window(binding.window_id, text)
             else:
-                await self._stream_reply(chatid, "未知命令。此群未绑定。")
+                await self._stream_reply(chatid, "Unknown command. Not bound.")
 
     async def _cmd_bind(self, chatid: str, path_str: str) -> None:
         if not path_str:
             await self._stream_reply(
-                chatid, "用法: /bind <目录路径>\n例如: /bind /home/user/Code/project"
+                chatid, "Usage: /bind <path>\nExample: /bind /home/user/Code/project"
             )
             return
 
         path = Path(path_str).expanduser().resolve()
         if not path.is_dir():
-            await self._stream_reply(chatid, f"目录不存在: {path}")
+            await self._stream_reply(chatid, f"Directory not found: {path}")
             return
 
         sessions = await session_manager.list_sessions_for_directory(str(path))
@@ -562,20 +564,20 @@ class WeComAIBot:
             self.wc.save_groups()
 
             lines = [
-                f"**已绑定到 {path}**\n",
-                "发现已有会话，回复数字恢复或输入 0 新建:\n",
+                f"**Bound to {path}**\n",
+                "Existing sessions found. Reply with a number to resume or 0 for new:\n",
             ]
             for i, s in enumerate(sessions):
                 summary = s.summary[:40] + "…" if len(s.summary) > 40 else s.summary
-                lines.append(f"**{i + 1}.** {summary} — {s.message_count} 条消息")
-            lines.append("\n**0.** 新建会话")
+                lines.append(f"**{i + 1}.** {summary} — {s.message_count} messages")
+            lines.append("\n**0.** New session")
             await self._stream_reply(chatid, "\n".join(lines))
             return
 
         binding = GroupBinding(cwd=str(path), name=path.name)
         self.wc.groups[chatid] = binding
         self.wc.save_groups()
-        await self._stream_reply(chatid, f"已绑定到 {path}")
+        await self._stream_reply(chatid, f"Bound to {path}")
         await self._ensure_window(chatid, binding)
 
     async def _cmd_unbind(self, chatid: str) -> None:
@@ -584,49 +586,49 @@ class WeComAIBot:
             if binding.window_id:
                 await tmux_manager.kill_window(binding.window_id)
             self.wc.save_groups()
-            await self._stream_reply(chatid, "已解绑")
+            await self._stream_reply(chatid, "Unbound")
         else:
-            await self._stream_reply(chatid, "此群未绑定")
+            await self._stream_reply(chatid, "Not bound")
 
     async def _cmd_verbose(self, chatid: str) -> None:
         binding = self.wc.groups.get(chatid)
         if not binding:
-            await self._stream_reply(chatid, "此群未绑定")
+            await self._stream_reply(chatid, "Not bound")
             return
         binding.verbose = not binding.verbose
         self.wc.save_groups()
-        status = "开启" if binding.verbose else "关闭"
-        await self._stream_reply(chatid, f"详细模式已{status}")
+        status = "on" if binding.verbose else "off"
+        await self._stream_reply(chatid, f"Verbose mode {status}")
 
     async def _cmd_esc(self, chatid: str) -> None:
         binding = self.wc.groups.get(chatid)
         if not binding or not binding.window_id:
-            await self._stream_reply(chatid, "此群未绑定或窗口不存在")
+            await self._stream_reply(chatid, "Not bound or window not found")
             return
         await tmux_manager.send_keys(
             binding.window_id, "Escape", enter=False, literal=False
         )
-        await self._stream_reply(chatid, "已发送 Escape")
+        await self._stream_reply(chatid, "Escape sent")
 
     async def _cmd_screenshot(self, chatid: str) -> None:
         binding = self.wc.groups.get(chatid)
         if not binding or not binding.window_id:
-            await self._stream_reply(chatid, "此群未绑定或窗口不存在")
+            await self._stream_reply(chatid, "Not bound or window not found")
             return
 
         pane_text = await tmux_manager.capture_pane(binding.window_id, with_ansi=True)
         if not pane_text:
-            await self._stream_reply(chatid, "截图失败")
+            await self._stream_reply(chatid, "Screenshot failed")
             return
 
         img_data = await text_to_image(pane_text, with_ansi=True)
         if not img_data:
-            await self._stream_reply(chatid, "渲染失败")
+            await self._stream_reply(chatid, "Render failed")
             return
 
         # Send screenshot as stream with msg_item image
         b64 = base64.b64encode(img_data).decode("ascii")
-        stream = await self._create_stream(chatid, "📸 终端截图")
+        stream = await self._create_stream(chatid, "📸 Terminal screenshot")
         if stream:
             await self._do_finish_stream(
                 chatid,
@@ -636,21 +638,21 @@ class WeComAIBot:
     async def _cmd_kill(self, chatid: str) -> None:
         binding = self.wc.groups.get(chatid)
         if not binding or not binding.window_id:
-            await self._stream_reply(chatid, "此群未绑定或窗口不存在")
+            await self._stream_reply(chatid, "Not bound or window not found")
             return
         await tmux_manager.kill_window(binding.window_id)
         binding.window_id = ""
-        await self._stream_reply(chatid, "窗口已关闭")
+        await self._stream_reply(chatid, "Window killed")
 
     async def _cmd_history(self, chatid: str) -> None:
         binding = self.wc.groups.get(chatid)
         if not binding or not binding.window_id:
-            await self._stream_reply(chatid, "此群未绑定或窗口不存在")
+            await self._stream_reply(chatid, "Not bound or window not found")
             return
 
         messages, total = await session_manager.get_recent_messages(binding.window_id)
         if not messages:
-            await self._stream_reply(chatid, "暂无历史消息")
+            await self._stream_reply(chatid, "No message history")
             return
 
         recent = messages[-10:]
@@ -663,12 +665,12 @@ class WeComAIBot:
             lines.append(f"{role} {text}")
 
         await self._stream_reply(
-            chatid, f"最近 {len(recent)} 条消息:\n\n" + "\n\n".join(lines)
+            chatid, f"Last {len(recent)} messages:\n\n" + "\n\n".join(lines)
         )
 
     async def _cmd_file(self, chatid: str, path_str: str) -> None:
         if not path_str:
-            await self._stream_reply(chatid, "用法: /file <文件路径>")
+            await self._stream_reply(chatid, "Usage: /file <path>")
             return
 
         # Strip invisible Unicode chars (WeCom may insert zero-width chars)
@@ -676,7 +678,7 @@ class WeComAIBot:
 
         binding = self.wc.groups.get(chatid)
         if not binding:
-            await self._stream_reply(chatid, "未绑定工作目录")
+            await self._stream_reply(chatid, "Not bound")
             return
 
         file_path = Path(path_str)
@@ -685,12 +687,12 @@ class WeComAIBot:
         file_path = file_path.resolve()
 
         if not file_path.is_file():
-            await self._stream_reply(chatid, f"文件不存在: {file_path}")
+            await self._stream_reply(chatid, f"File not found: {file_path}")
             return
 
         sent = await self._send_file_via_app(chatid, str(file_path))
         if sent:
-            await self._stream_reply(chatid, f"📄 已发送文件: `{file_path.name}`")
+            await self._stream_reply(chatid, f"📄 File sent: `{file_path.name}`")
         else:
             size = file_path.stat().st_size
             size_str = (
@@ -700,8 +702,8 @@ class WeComAIBot:
             )
             await self._stream_reply(
                 chatid,
-                f"📄 文件: `{file_path}`\n大小: {size_str}\n\n"
-                "⚠️ 文件发送需要配置 WECOM_AGENT_ID。",
+                f"📄 File: `{file_path}`\nSize: {size_str}\n\n"
+                "⚠️ File sending requires WECOM_AGENT_ID.",
             )
 
     # --- File sending via self-built app API ---
@@ -754,7 +756,7 @@ class WeComAIBot:
             return
 
         if choice < 0 or choice > len(sessions):
-            await self._stream_reply(chatid, f"无效选择，请输入 0-{len(sessions)}")
+            await self._stream_reply(chatid, f"Invalid choice, enter 0-{len(sessions)}")
             self._pending_session_pick[chatid] = sessions
             if pending_text:
                 self._pending_messages[chatid] = pending_text
@@ -762,10 +764,10 @@ class WeComAIBot:
 
         resume_id: str | None = None
         if choice == 0 or not sessions:
-            await self._stream_reply(chatid, "新建会话...")
+            await self._stream_reply(chatid, "Creating new session...")
         else:
             selected = sessions[choice - 1]
-            await self._stream_reply(chatid, f"恢复会话: {selected.summary[:50]}")
+            await self._stream_reply(chatid, f"Resuming: {selected.summary[:50]}")
             resume_id = selected.session_id
 
         await self._ensure_window(chatid, binding, resume_session_id=resume_id)
@@ -788,15 +790,15 @@ class WeComAIBot:
         if ui_type == "permission":
             if reply in ("Y", "YES"):
                 await tmux_manager.send_keys(binding.window_id, "y")
-                await self._update_stream(chatid, "\n\n✅ 已允许")
+                await self._update_stream(chatid, "\n\n✅ Allowed")
             else:
                 await tmux_manager.send_keys(binding.window_id, "n")
-                await self._update_stream(chatid, "\n\n❌ 已拒绝")
+                await self._update_stream(chatid, "\n\n❌ Denied")
         elif ui_type == "planmode":
             await tmux_manager.send_keys(
                 binding.window_id, "", enter=True, literal=False
             )
-            await self._update_stream(chatid, "\n\n✅ 已确认执行")
+            await self._update_stream(chatid, "\n\n✅ Confirmed")
         elif ui_type == "question":
             # For questions, forward the actual reply text
             await session_manager.send_to_window(binding.window_id, reply)
@@ -836,10 +838,10 @@ class WeComAIBot:
 
         if "permission" in ui_name.lower():
             self._pending_interactive[chatid] = "permission"
-            prompt = f"⚠️ 需要权限确认:\n{text}\n\n回复 **Y** 允许 / **N** 拒绝"
+            prompt = f"⚠️ Permission required:\n{text}\n\nReply **Y** to allow / **N** to deny"
         elif ui_name == "ExitPlanMode":
             self._pending_interactive[chatid] = "planmode"
-            prompt = f"📋 计划已就绪:\n{text}\n\n回复 **OK** 确认执行"
+            prompt = f"📋 Plan ready:\n{text}\n\nReply **OK** to confirm"
         elif ui_name == "AskUserQuestion":
             self._pending_interactive[chatid] = "question"
             prompt = f"❓ {text}"
@@ -1030,11 +1032,11 @@ class WeComAIBot:
                         sent = await self._send_file_via_app(chatid, file_path)
                         if sent:
                             await self._update_stream(
-                                chatid, f"\n\n📄 已发送文件: `{p.name}`"
+                                chatid, f"\n\n📄 File sent: `{p.name}`"
                             )
                         else:
                             await self._update_stream(
-                                chatid, f"\n\n📄 已写入文件: `{file_path}`"
+                                chatid, f"\n\n📄 File written: `{file_path}`"
                             )
 
             if verbose:
