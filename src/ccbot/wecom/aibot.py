@@ -1,0 +1,1210 @@
+"""WeCom AI Bot (智能机器人) — WebSocket long-connection mode.
+
+Main entry point for the WeCom AI Bot mode. Connects to WeCom via outbound
+WebSocket (no public port needed), receives messages as JSON frames, and
+replies using stream responses (single message that updates in real-time).
+
+Core responsibilities:
+  - WebSocket message dispatching (text, voice, image, file, event)
+  - Stream lifecycle management (create/update/finish with throttling)
+  - Command handling (/bind, /unbind, /verbose, /esc, /screenshot, /kill, /history)
+  - Interactive UI via text prompts (Permission → Y/N, PlanMode → OK)
+  - Session monitor integration for Claude output → stream updates
+  - Tool collection for verbose mode
+
+Key function: run_wecom_aibot().
+"""
+
+import asyncio
+import base64
+import logging
+import re
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from ..terminal_parser import InteractiveUIContent
+
+from ..screenshot import text_to_image
+from ..session import session_manager
+from ..session_monitor import NewMessage, SessionMonitor
+from ..terminal_parser import extract_interactive_content, is_interactive_ui
+from ..tmux_manager import tmux_manager
+from .config import GroupBinding, WeComConfig
+from .ws_client import WeComWSClient
+
+logger = logging.getLogger(__name__)
+
+# Stream update throttle: minimum interval between sends (ms)
+STREAM_THROTTLE_MS = 800
+# Stream auto-finish delay after last content update (seconds)
+STREAM_FINISH_DELAY = 5.0
+# Stream content byte limit (WeCom limit is 20480, leave margin)
+STREAM_MAX_BYTES = 19000
+# Stale stream cleanup interval and TTL
+STREAM_CLEANUP_INTERVAL = 60  # seconds
+STREAM_TTL = 600  # 10 minutes
+
+# File extensions for document auto-mention in stream
+_DOCUMENT_EXTENSIONS = {
+    ".docx",
+    ".doc",
+    ".pdf",
+    ".xlsx",
+    ".xls",
+    ".csv",
+    ".pptx",
+    ".ppt",
+    ".zip",
+    ".tar",
+    ".gz",
+    ".7z",
+    ".html",
+    ".htm",
+    ".md",
+    ".txt",
+    ".json",
+    ".yaml",
+    ".yml",
+}
+
+
+def _extract_file_path(tool_text: str) -> str:
+    """Extract file path from Write tool summary like '**Write**(path/to/file)'."""
+    match = re.search(r"\*\*Write\*\*\((.+)\)", tool_text)
+    return match.group(1) if match else ""
+
+
+def _is_document_file(path: str) -> bool:
+    return Path(path).suffix.lower() in _DOCUMENT_EXTENSIONS
+
+
+def _extract_document_paths(text: str) -> list[str]:
+    """Extract absolute file paths with document extensions from assistant text."""
+    paths: list[str] = []
+    for match in re.finditer(r"(/[^\s`\"'<>]+)", text):
+        candidate = match.group(1).rstrip(".,;:)。，；：）")
+        if _is_document_file(candidate) and Path(candidate).is_file():
+            paths.append(candidate)
+    return paths
+
+
+@dataclass
+class ToolCollector:
+    """Collects tool_use summaries for verbose mode batch sending."""
+
+    tools: list[str] = field(default_factory=list)
+
+    def add(self, tool_name: str, summary: str) -> None:
+        if summary:
+            self.tools.append(summary.replace("**", "").replace("*", ""))
+        else:
+            self.tools.append(tool_name)
+
+    def flush(self) -> str | None:
+        """Generate summary and clear. Returns None if empty."""
+        if not self.tools:
+            return None
+        count = len(self.tools)
+        lines = "\n".join(f"• {t}" for t in self.tools)
+        self.tools.clear()
+        return f"🔧 执行了 {count} 个工具:\n{lines}"
+
+
+@dataclass
+class ChatStream:
+    """Active stream state for a chat."""
+
+    stream_id: str
+    msg_req_id: str  # req_id from incoming aibot_msg_callback (required for replies)
+    content: str = ""
+    finished: bool = False
+    last_send_time: float = 0
+    pending_images: list[tuple[str, bytes]] = field(default_factory=list)
+    finish_timer: asyncio.TimerHandle | None = None
+    throttle_timer: asyncio.TimerHandle | None = None
+    created_at: float = field(default_factory=time.time)
+    _dirty: bool = False  # content updated but not yet sent due to throttle
+
+
+class WeComAIBot:
+    """WeCom AI Bot application (WebSocket long-connection mode)."""
+
+    def __init__(self, wecom_config: WeComConfig) -> None:
+        self.wc = wecom_config
+        self.ws = WeComWSClient(
+            bot_id=wecom_config.bot_id,
+            bot_secret=wecom_config.bot_secret,
+        )
+        self.monitor = SessionMonitor()
+
+        # Per-chat state
+        self._streams: dict[str, ChatStream] = {}  # chatid → active stream
+        self._chat_req_ids: dict[str, str] = {}  # chatid → latest msg_req_id
+        self._tool_collectors: dict[str, ToolCollector] = {}
+        self._pending_messages: dict[
+            str, str
+        ] = {}  # chatid → text (during window creation)
+        self._pending_session_pick: dict[str, list[Any]] = {}
+        self._pending_interactive: dict[
+            str, str
+        ] = {}  # chatid → "permission"|"planmode"|"question"
+        self._pending_writes: dict[str, str] = {}  # tool_use_id → file_path
+
+        # Optional: WeCom client for media downloads and file sending
+        # (requires corp_id + secret; file sending also needs agent_id)
+        self._media_client: Any | None = None
+
+    # --- Lifecycle ---
+
+    async def start(self) -> None:
+        """Initialize connections, restore bindings, start monitoring."""
+        # Optional media client (for downloading media + sending files via app API)
+        if self.wc.corp_id and self.wc.secret:
+            from .client import WeComClient
+
+            self._media_client = WeComClient(
+                corp_id=self.wc.corp_id,
+                secret=self.wc.secret,
+                agent_id=self.wc.agent_id,
+            )
+            if self.wc.agent_id:
+                logger.info(
+                    "File sending enabled via self-built app (agent_id=%d)",
+                    self.wc.agent_id,
+                )
+
+        # Resolve stale window IDs
+        await session_manager.resolve_stale_ids()
+
+        # Restore window bindings
+        await self._restore_bindings()
+
+        # Setup session monitor
+        self.monitor.set_message_callback(self._on_new_message)
+        self.monitor.start()
+
+        # Setup WebSocket
+        self.ws.set_message_callback(self._on_ws_message)
+        await self.ws.connect()
+
+        # Start background tasks
+        asyncio.create_task(self._poll_interactive_ui())
+        asyncio.create_task(self._cleanup_stale_streams())
+
+    async def shutdown(self) -> None:
+        """Clean shutdown."""
+        self.monitor.stop()
+        await self.ws.close()
+        if self._media_client:
+            await self._media_client.close()
+
+    # --- WebSocket message dispatch ---
+
+    async def _on_ws_message(self, data: dict[str, Any]) -> None:
+        """Handle incoming WebSocket frames from WeCom."""
+        cmd = data.get("cmd", "")
+        body = data.get("body", {})
+        headers = data.get("headers", {})
+        msg_req_id = headers.get("req_id", "")
+
+        if cmd == "aibot_msg_callback":
+            await self._dispatch_message(body, msg_req_id)
+        elif cmd == "aibot_event_callback":
+            event = body.get("event", {})
+            event_type = event.get("eventtype", "")
+            logger.info("Event callback: %s", event_type)
+            # enter_chat events etc. — do NOT reply (causes 846605)
+
+    async def _dispatch_message(self, body: dict[str, Any], msg_req_id: str) -> None:
+        """Route an incoming message by type."""
+        msgtype = body.get("msgtype", "")
+        chatid = body.get("chatid", "")
+        chattype = body.get("chattype", "single")
+        from_info = body.get("from", {})
+        userid = from_info.get("userid", "")
+
+        # For DMs, use virtual chat ID
+        if chattype == "single":
+            chatid = f"dm:{userid}"
+
+        if not chatid:
+            logger.warning("Message without chatid: %s", body)
+            return
+
+        # Check user permission
+        if not self.wc.is_user_allowed(userid):
+            logger.warning("Unauthorized user: %s", userid)
+            return
+
+        logger.info(
+            "Message from user=%s chat=%s type=%s req_id=%s",
+            userid,
+            chatid,
+            msgtype,
+            msg_req_id[:20] if msg_req_id else "none",
+        )
+
+        # Store the latest msg_req_id for this chat (needed for stream replies)
+        if msg_req_id:
+            self._chat_req_ids[chatid] = msg_req_id
+
+        if msgtype == "text":
+            content = body.get("text", {}).get("content", "")
+            if content:
+                await self._handle_text_message(chatid, userid, content)
+
+        elif msgtype == "voice":
+            if self._media_client:
+                media_id = body.get("voice", {}).get("media_id", "")
+                if media_id:
+                    asyncio.create_task(
+                        self._handle_voice_message(chatid, userid, media_id)
+                    )
+            else:
+                await self._stream_reply(
+                    chatid, "语音消息需要配置 WECOM_CORP_ID 和 WECOM_SECRET"
+                )
+
+        elif msgtype == "image":
+            # Images come with a URL in WS mode
+            image_url = body.get("image", {}).get("url", "")
+            if image_url:
+                asyncio.create_task(
+                    self._handle_image_message(chatid, userid, image_url)
+                )
+
+        elif msgtype == "file":
+            if self._media_client:
+                media_id = body.get("file", {}).get("media_id", "")
+                file_name = body.get("file", {}).get("file_name", "file")
+                if media_id:
+                    asyncio.create_task(
+                        self._handle_file_message(chatid, userid, media_id, file_name)
+                    )
+            else:
+                await self._stream_reply(
+                    chatid, "文件接收需要配置 WECOM_CORP_ID 和 WECOM_SECRET"
+                )
+
+        elif msgtype == "mixed":
+            # Mixed messages (image + text) — extract text part
+            items = body.get("mixed", {}).get("items", [])
+            text_parts = []
+            for item in items:
+                if item.get("msgtype") == "text":
+                    text_parts.append(item.get("text", {}).get("content", ""))
+            if text_parts:
+                combined = "\n".join(text_parts)
+                await self._handle_text_message(chatid, userid, combined)
+
+    # --- Text message handling ---
+
+    async def _handle_text_message(self, chatid: str, userid: str, text: str) -> None:
+        """Process an incoming text message."""
+        # Strip invisible Unicode chars that WeCom may insert
+        text = text.strip("\u200b\u200c\u200d\u2060\ufeff")
+
+        # Handle pending session picker
+        if chatid in self._pending_session_pick and text.strip().isdigit():
+            await self._handle_session_pick(chatid, int(text.strip()))
+            return
+
+        # Handle interactive replies (Y/N/OK)
+        if chatid in self._pending_interactive:
+            normalized = text.strip().upper()
+            if normalized in ("Y", "YES", "N", "NO", "OK"):
+                await self._handle_interactive_reply(chatid, normalized)
+                return
+
+        # Handle commands
+        if text.startswith("/"):
+            await self._handle_command(chatid, userid, text)
+            return
+
+        # Find group binding
+        binding = self.wc.groups.get(chatid)
+        if not binding:
+            await self._stream_reply(
+                chatid, "未绑定工作目录。请使用 /bind <目录路径> 命令绑定。"
+            )
+            return
+
+        # Finish any existing stream before creating a new one
+        if chatid in self._streams and not self._streams[chatid].finished:
+            await self._finish_stream(chatid)
+
+        # Ensure tmux window exists
+        if not binding.window_id:
+            sessions = await session_manager.list_sessions_for_directory(binding.cwd)
+            if sessions:
+                self._pending_session_pick[chatid] = sessions
+                self._pending_messages[chatid] = text
+                lines = ["窗口已关闭，发现已有会话。回复数字恢复或输入 0 新建:\n"]
+                for i, s in enumerate(sessions):
+                    summary = s.summary[:40] + "…" if len(s.summary) > 40 else s.summary
+                    lines.append(f"**{i + 1}.** {summary} — {s.message_count} 条消息")
+                lines.append("\n**0.** 新建会话")
+                await self._stream_reply(chatid, "\n".join(lines))
+                return
+
+            await self._ensure_window(chatid, binding)
+            if not binding.window_id:
+                await self._stream_reply(chatid, "创建窗口失败")
+                return
+            await asyncio.sleep(2)
+
+        # Create stream placeholder and send to tmux
+        await self._create_stream(chatid, "⏳")
+
+        success, msg = await session_manager.send_to_window(binding.window_id, text)
+        if not success:
+            logger.warning(
+                "Window %s gone, recreating for %s", binding.window_id, chatid
+            )
+            binding.window_id = ""
+            await self._ensure_window(chatid, binding)
+            if binding.window_id:
+                success, msg = await session_manager.send_to_window(
+                    binding.window_id, text
+                )
+            if not success:
+                await self._update_stream(chatid, f"发送失败: {msg}")
+                await self._finish_stream(chatid)
+
+    # --- Media message handling ---
+
+    async def _handle_voice_message(
+        self, chatid: str, userid: str, media_id: str
+    ) -> None:
+        """Download voice, convert AMR→MP3, transcribe, and process as text."""
+        if not self._media_client:
+            return
+
+        try:
+            amr_data = await self._media_client.download_media(media_id)
+        except Exception as e:
+            logger.error("Failed to download voice: %s", e)
+            await self._stream_reply(chatid, f"语音下载失败: {e}")
+            return
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-i",
+                "pipe:0",
+                "-f",
+                "mp3",
+                "pipe:1",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            mp3_data, stderr = await proc.communicate(amr_data)
+            if proc.returncode != 0:
+                raise RuntimeError(f"ffmpeg error: {stderr.decode()[:200]}")
+        except Exception as e:
+            logger.error("Failed to convert voice: %s", e)
+            await self._stream_reply(chatid, f"语音转换失败: {e}")
+            return
+
+        try:
+            from ..transcribe import transcribe_voice
+
+            text = await transcribe_voice(
+                mp3_data, filename="voice.mp3", mime_type="audio/mpeg"
+            )
+        except Exception as e:
+            logger.error("Failed to transcribe voice: %s", e)
+            await self._stream_reply(chatid, f"语音转文字失败: {e}")
+            return
+
+        logger.info("Voice transcribed for %s: %s", userid, text[:80])
+        await self._stream_reply(chatid, f"🎤 {text}")
+        await self._handle_text_message(chatid, userid, text)
+
+    async def _handle_image_message(
+        self, chatid: str, userid: str, image_url: str
+    ) -> None:
+        """Download image from URL, save to working directory, notify Claude."""
+        binding = self.wc.groups.get(chatid)
+        if not binding or not binding.cwd:
+            await self._stream_reply(chatid, "未绑定工作目录，无法接收图片。")
+            return
+
+        try:
+            import aiohttp
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(image_url) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"HTTP {resp.status}")
+                    data = await resp.read()
+        except Exception as e:
+            logger.error("Failed to download image: %s", e)
+            await self._stream_reply(chatid, f"图片下载失败: {e}")
+            return
+
+        save_dir = Path(binding.cwd) / "uploads"
+        save_dir.mkdir(exist_ok=True)
+        save_path = save_dir / f"image_{uuid.uuid4().hex[:8]}.jpg"
+
+        try:
+            save_path.write_bytes(data)
+        except Exception as e:
+            logger.error("Failed to save image: %s", e)
+            await self._stream_reply(chatid, f"图片保存失败: {e}")
+            return
+
+        logger.info("Saved image %s (%d bytes) for %s", save_path, len(data), userid)
+        await self._stream_reply(chatid, f"图片已保存: `{save_path.name}`")
+
+        if binding.window_id:
+            msg = f"用户发送了图片，已保存到: {save_path}"
+            await session_manager.send_to_window(binding.window_id, msg)
+
+    async def _handle_file_message(
+        self, chatid: str, userid: str, media_id: str, file_name: str
+    ) -> None:
+        """Download file via media API, save to working directory, notify Claude."""
+        if not self._media_client:
+            return
+
+        binding = self.wc.groups.get(chatid)
+        if not binding or not binding.cwd:
+            await self._stream_reply(chatid, "未绑定工作目录，无法接收文件。")
+            return
+
+        try:
+            data = await self._media_client.download_media(media_id)
+        except Exception as e:
+            logger.error("Failed to download file: %s", e)
+            await self._stream_reply(chatid, f"文件下载失败: {e}")
+            return
+
+        save_dir = Path(binding.cwd) / "uploads"
+        save_dir.mkdir(exist_ok=True)
+        save_path = save_dir / file_name
+        if save_path.exists():
+            stem = save_path.stem
+            suffix = save_path.suffix
+            i = 1
+            while save_path.exists():
+                save_path = save_dir / f"{stem}_{i}{suffix}"
+                i += 1
+
+        try:
+            save_path.write_bytes(data)
+        except Exception as e:
+            logger.error("Failed to save file %s: %s", save_path, e)
+            await self._stream_reply(chatid, f"文件保存失败: {e}")
+            return
+
+        logger.info("Saved file %s (%d bytes) for %s", save_path, len(data), userid)
+        await self._stream_reply(chatid, f"文件已保存: `{save_path.name}`")
+
+        if binding.window_id:
+            msg = f"用户发送了文件，已保存到: {save_path}"
+            await session_manager.send_to_window(binding.window_id, msg)
+
+    # --- Command handling ---
+
+    async def _handle_command(self, chatid: str, userid: str, text: str) -> None:
+        """Handle a slash command."""
+        parts = text.strip().split(maxsplit=1)
+        cmd = parts[0].lower()
+        arg = parts[1] if len(parts) > 1 else ""
+
+        if cmd == "/bind":
+            await self._cmd_bind(chatid, arg)
+        elif cmd == "/unbind":
+            await self._cmd_unbind(chatid)
+        elif cmd == "/verbose":
+            await self._cmd_verbose(chatid)
+        elif cmd == "/esc":
+            await self._cmd_esc(chatid)
+        elif cmd == "/screenshot":
+            await self._cmd_screenshot(chatid)
+        elif cmd == "/kill":
+            await self._cmd_kill(chatid)
+        elif cmd == "/history":
+            await self._cmd_history(chatid)
+        elif cmd == "/file":
+            await self._cmd_file(chatid, arg)
+        else:
+            # Forward unknown /commands to Claude as-is
+            binding = self.wc.groups.get(chatid)
+            if binding and binding.window_id:
+                await session_manager.send_to_window(binding.window_id, text)
+            else:
+                await self._stream_reply(chatid, "未知命令。此群未绑定。")
+
+    async def _cmd_bind(self, chatid: str, path_str: str) -> None:
+        if not path_str:
+            await self._stream_reply(
+                chatid, "用法: /bind <目录路径>\n例如: /bind /home/user/Code/project"
+            )
+            return
+
+        path = Path(path_str).expanduser().resolve()
+        if not path.is_dir():
+            await self._stream_reply(chatid, f"目录不存在: {path}")
+            return
+
+        sessions = await session_manager.list_sessions_for_directory(str(path))
+        if sessions:
+            self._pending_session_pick[chatid] = sessions
+            binding = GroupBinding(cwd=str(path), name=path.name)
+            self.wc.groups[chatid] = binding
+            self.wc.save_groups()
+
+            lines = [
+                f"**已绑定到 {path}**\n",
+                "发现已有会话，回复数字恢复或输入 0 新建:\n",
+            ]
+            for i, s in enumerate(sessions):
+                summary = s.summary[:40] + "…" if len(s.summary) > 40 else s.summary
+                lines.append(f"**{i + 1}.** {summary} — {s.message_count} 条消息")
+            lines.append("\n**0.** 新建会话")
+            await self._stream_reply(chatid, "\n".join(lines))
+            return
+
+        binding = GroupBinding(cwd=str(path), name=path.name)
+        self.wc.groups[chatid] = binding
+        self.wc.save_groups()
+        await self._stream_reply(chatid, f"已绑定到 {path}")
+        await self._ensure_window(chatid, binding)
+
+    async def _cmd_unbind(self, chatid: str) -> None:
+        binding = self.wc.groups.pop(chatid, None)
+        if binding:
+            if binding.window_id:
+                await tmux_manager.kill_window(binding.window_id)
+            self.wc.save_groups()
+            await self._stream_reply(chatid, "已解绑")
+        else:
+            await self._stream_reply(chatid, "此群未绑定")
+
+    async def _cmd_verbose(self, chatid: str) -> None:
+        binding = self.wc.groups.get(chatid)
+        if not binding:
+            await self._stream_reply(chatid, "此群未绑定")
+            return
+        binding.verbose = not binding.verbose
+        self.wc.save_groups()
+        status = "开启" if binding.verbose else "关闭"
+        await self._stream_reply(chatid, f"详细模式已{status}")
+
+    async def _cmd_esc(self, chatid: str) -> None:
+        binding = self.wc.groups.get(chatid)
+        if not binding or not binding.window_id:
+            await self._stream_reply(chatid, "此群未绑定或窗口不存在")
+            return
+        await tmux_manager.send_keys(
+            binding.window_id, "Escape", enter=False, literal=False
+        )
+        await self._stream_reply(chatid, "已发送 Escape")
+
+    async def _cmd_screenshot(self, chatid: str) -> None:
+        binding = self.wc.groups.get(chatid)
+        if not binding or not binding.window_id:
+            await self._stream_reply(chatid, "此群未绑定或窗口不存在")
+            return
+
+        pane_text = await tmux_manager.capture_pane(binding.window_id, with_ansi=True)
+        if not pane_text:
+            await self._stream_reply(chatid, "截图失败")
+            return
+
+        img_data = await text_to_image(pane_text, with_ansi=True)
+        if not img_data:
+            await self._stream_reply(chatid, "渲染失败")
+            return
+
+        # Send screenshot as stream with msg_item image
+        b64 = base64.b64encode(img_data).decode("ascii")
+        stream = await self._create_stream(chatid, "📸 终端截图")
+        if stream:
+            await self._do_finish_stream(
+                chatid,
+                msg_item=[{"msgtype": "image", "image": {"base64": b64}}],
+            )
+
+    async def _cmd_kill(self, chatid: str) -> None:
+        binding = self.wc.groups.get(chatid)
+        if not binding or not binding.window_id:
+            await self._stream_reply(chatid, "此群未绑定或窗口不存在")
+            return
+        await tmux_manager.kill_window(binding.window_id)
+        binding.window_id = ""
+        await self._stream_reply(chatid, "窗口已关闭")
+
+    async def _cmd_history(self, chatid: str) -> None:
+        binding = self.wc.groups.get(chatid)
+        if not binding or not binding.window_id:
+            await self._stream_reply(chatid, "此群未绑定或窗口不存在")
+            return
+
+        messages, total = await session_manager.get_recent_messages(binding.window_id)
+        if not messages:
+            await self._stream_reply(chatid, "暂无历史消息")
+            return
+
+        recent = messages[-10:]
+        lines = []
+        for msg in recent:
+            role = "👤" if msg["role"] == "user" else "🤖"
+            text = msg["text"][:200]
+            if len(msg["text"]) > 200:
+                text += "..."
+            lines.append(f"{role} {text}")
+
+        await self._stream_reply(
+            chatid, f"最近 {len(recent)} 条消息:\n\n" + "\n\n".join(lines)
+        )
+
+    async def _cmd_file(self, chatid: str, path_str: str) -> None:
+        if not path_str:
+            await self._stream_reply(chatid, "用法: /file <文件路径>")
+            return
+
+        # Strip invisible Unicode chars (WeCom may insert zero-width chars)
+        path_str = path_str.strip().strip("\u200b\u200c\u200d\u2060\ufeff")
+
+        binding = self.wc.groups.get(chatid)
+        if not binding:
+            await self._stream_reply(chatid, "未绑定工作目录")
+            return
+
+        file_path = Path(path_str)
+        if not file_path.is_absolute():
+            file_path = Path(binding.cwd) / file_path
+        file_path = file_path.resolve()
+
+        if not file_path.is_file():
+            await self._stream_reply(chatid, f"文件不存在: {file_path}")
+            return
+
+        sent = await self._send_file_via_app(chatid, str(file_path))
+        if sent:
+            await self._stream_reply(chatid, f"📄 已发送文件: `{file_path.name}`")
+        else:
+            size = file_path.stat().st_size
+            size_str = (
+                f"{size / 1024 / 1024:.1f}MB"
+                if size > 1024 * 1024
+                else f"{size / 1024:.1f}KB"
+            )
+            await self._stream_reply(
+                chatid,
+                f"📄 文件: `{file_path}`\n大小: {size_str}\n\n"
+                "⚠️ 文件发送需要配置 WECOM_AGENT_ID。",
+            )
+
+    # --- File sending via self-built app API ---
+
+    def _can_send_files(self) -> bool:
+        """Check if file sending via self-built app API is available."""
+        return self._media_client is not None and self.wc.agent_id != 0
+
+    async def _send_file_via_app(self, chatid: str, file_path: str) -> bool:
+        """Send a file to user via self-built app API. Returns True if successful."""
+        if not self._can_send_files():
+            return False
+
+        p = Path(file_path)
+        if not p.is_file():
+            return False
+
+        size = p.stat().st_size
+        if size > 20 * 1024 * 1024:
+            logger.warning("File too large for sending: %s (%d bytes)", file_path, size)
+            return False
+
+        try:
+            data = p.read_bytes()
+            media_id = await self._media_client.upload_media("file", data, p.name)
+            # Determine target: DM uses message/send, group not supported via app API
+            if chatid.startswith("dm:"):
+                userid = chatid.removeprefix("dm:")
+                await self._media_client.send_file_to_user(userid, media_id)
+            else:
+                # For group chats, send to all allowed users as DM
+                # (app API can't send to bot group chats directly)
+                logger.warning(
+                    "File sending to group %s not supported, skipping", chatid
+                )
+                return False
+            logger.info("Sent file %s to %s via app API", p.name, chatid)
+            return True
+        except Exception as e:
+            logger.error("Failed to send file %s via app API: %s", file_path, e)
+            return False
+
+    # --- Session picker ---
+
+    async def _handle_session_pick(self, chatid: str, choice: int) -> None:
+        sessions = self._pending_session_pick.pop(chatid, [])
+        pending_text = self._pending_messages.pop(chatid, None)
+        binding = self.wc.groups.get(chatid)
+        if not binding:
+            return
+
+        if choice < 0 or choice > len(sessions):
+            await self._stream_reply(chatid, f"无效选择，请输入 0-{len(sessions)}")
+            self._pending_session_pick[chatid] = sessions
+            if pending_text:
+                self._pending_messages[chatid] = pending_text
+            return
+
+        resume_id: str | None = None
+        if choice == 0 or not sessions:
+            await self._stream_reply(chatid, "新建会话...")
+        else:
+            selected = sessions[choice - 1]
+            await self._stream_reply(chatid, f"恢复会话: {selected.summary[:50]}")
+            resume_id = selected.session_id
+
+        await self._ensure_window(chatid, binding, resume_session_id=resume_id)
+
+        if pending_text and binding.window_id:
+            await session_manager.send_to_window(binding.window_id, pending_text)
+
+    # --- Interactive UI handling ---
+
+    async def _handle_interactive_reply(self, chatid: str, reply: str) -> None:
+        """Handle Y/N/OK replies to interactive prompts."""
+        ui_type = self._pending_interactive.pop(chatid, None)
+        if not ui_type:
+            return
+
+        binding = self.wc.groups.get(chatid)
+        if not binding or not binding.window_id:
+            return
+
+        if ui_type == "permission":
+            if reply in ("Y", "YES"):
+                await tmux_manager.send_keys(binding.window_id, "y")
+                await self._update_stream(chatid, "\n\n✅ 已允许")
+            else:
+                await tmux_manager.send_keys(binding.window_id, "n")
+                await self._update_stream(chatid, "\n\n❌ 已拒绝")
+        elif ui_type == "planmode":
+            await tmux_manager.send_keys(
+                binding.window_id, "", enter=True, literal=False
+            )
+            await self._update_stream(chatid, "\n\n✅ 已确认执行")
+        elif ui_type == "question":
+            # For questions, forward the actual reply text
+            await session_manager.send_to_window(binding.window_id, reply)
+
+    async def _poll_interactive_ui(self) -> None:
+        """Background task to detect interactive UIs in terminal."""
+        while True:
+            try:
+                for chatid, binding in self.wc.groups.items():
+                    if not binding.window_id:
+                        continue
+                    if chatid in self._pending_interactive:
+                        continue  # Already waiting for response
+
+                    w = await tmux_manager.find_window_by_id(binding.window_id)
+                    if not w:
+                        continue
+
+                    pane_text = await tmux_manager.capture_pane(w.window_id)
+                    if not pane_text or not is_interactive_ui(pane_text):
+                        continue
+
+                    ui_content = extract_interactive_content(pane_text)
+                    if ui_content:
+                        await self._send_interactive_prompt(chatid, ui_content)
+            except Exception as e:
+                logger.error("Interactive UI poll error: %s", e)
+
+            await asyncio.sleep(2.0)
+
+    async def _send_interactive_prompt(
+        self, chatid: str, ui_content: "InteractiveUIContent"
+    ) -> None:
+        """Send a text prompt for an interactive UI (no template cards in bot mode)."""
+        ui_name = ui_content.name
+        text = ui_content.content
+
+        if "permission" in ui_name.lower():
+            self._pending_interactive[chatid] = "permission"
+            prompt = f"⚠️ 需要权限确认:\n{text}\n\n回复 **Y** 允许 / **N** 拒绝"
+        elif ui_name == "ExitPlanMode":
+            self._pending_interactive[chatid] = "planmode"
+            prompt = f"📋 计划已就绪:\n{text}\n\n回复 **OK** 确认执行"
+        elif ui_name == "AskUserQuestion":
+            self._pending_interactive[chatid] = "question"
+            prompt = f"❓ {text}"
+        else:
+            prompt = text
+
+        await self._update_stream(chatid, f"\n\n{prompt}")
+
+    # --- Stream management ---
+
+    async def _stream_reply(self, chatid: str, content: str) -> None:
+        """Quick helper: create stream, set content, finish immediately."""
+        await self._create_stream(chatid, content)
+        await self._do_finish_stream(chatid)
+
+    async def _create_stream(
+        self, chatid: str, initial_content: str = ""
+    ) -> ChatStream | None:
+        """Create a new stream for a chat, finishing any existing one first."""
+        # Must have a msg_req_id from an incoming message
+        msg_req_id = self._chat_req_ids.get(chatid, "")
+        if not msg_req_id:
+            logger.warning("Cannot create stream for %s: no msg_req_id", chatid)
+            return None
+
+        # Finish existing stream
+        if chatid in self._streams and not self._streams[chatid].finished:
+            await self._do_finish_stream(chatid)
+
+        stream_id = uuid.uuid4().hex
+        stream = ChatStream(
+            stream_id=stream_id,
+            msg_req_id=msg_req_id,
+            content=initial_content,
+        )
+        self._streams[chatid] = stream
+
+        # Send initial content
+        sent = await self.ws.send_stream(
+            msg_req_id=msg_req_id,
+            stream_id=stream_id,
+            content=initial_content,
+            finish=False,
+        )
+        if sent:
+            stream.last_send_time = time.time()
+
+        return stream
+
+    async def _update_stream(self, chatid: str, append_text: str) -> None:
+        """Append text to the active stream and send with throttling."""
+        stream = self._streams.get(chatid)
+        if not stream or stream.finished:
+            # No active stream — create one
+            stream = await self._create_stream(chatid, append_text)
+            return
+
+        stream.content += append_text
+        stream._dirty = True
+
+        # Check content size limit
+        if len(stream.content.encode("utf-8")) >= STREAM_MAX_BYTES:
+            await self._do_finish_stream(chatid)
+            return
+
+        # Reset finish timer
+        self._reset_finish_timer(chatid)
+
+        # Throttle: check if we can send now
+        now = time.time()
+        elapsed_ms = (now - stream.last_send_time) * 1000
+
+        if elapsed_ms >= STREAM_THROTTLE_MS:
+            await self._send_stream_update(chatid, stream)
+        else:
+            # Schedule delayed send if not already scheduled
+            if stream.throttle_timer is None:
+                delay = (STREAM_THROTTLE_MS - elapsed_ms) / 1000
+                loop = asyncio.get_event_loop()
+                stream.throttle_timer = loop.call_later(
+                    delay,
+                    lambda cid=chatid: asyncio.create_task(self._throttled_send(cid)),
+                )
+
+    async def _throttled_send(self, chatid: str) -> None:
+        """Send a throttled stream update."""
+        stream = self._streams.get(chatid)
+        if not stream or stream.finished or not stream._dirty:
+            return
+        stream.throttle_timer = None
+        await self._send_stream_update(chatid, stream)
+
+    async def _send_stream_update(self, chatid: str, stream: ChatStream) -> None:
+        """Actually send the stream content to WeCom."""
+        sent = await self.ws.send_stream(
+            msg_req_id=stream.msg_req_id,
+            stream_id=stream.stream_id,
+            content=stream.content,
+            finish=False,
+        )
+        if sent:
+            stream.last_send_time = time.time()
+            stream._dirty = False
+
+    def _reset_finish_timer(self, chatid: str) -> None:
+        """Reset the auto-finish timer for a stream."""
+        stream = self._streams.get(chatid)
+        if not stream or stream.finished:
+            return
+
+        if stream.finish_timer:
+            stream.finish_timer.cancel()
+
+        loop = asyncio.get_event_loop()
+        stream.finish_timer = loop.call_later(
+            STREAM_FINISH_DELAY,
+            lambda cid=chatid: asyncio.create_task(self._finish_stream(cid)),
+        )
+
+    async def _finish_stream(self, chatid: str) -> None:
+        """Finish the active stream (triggered by timer or new message)."""
+        await self._do_finish_stream(chatid)
+
+    async def _do_finish_stream(
+        self,
+        chatid: str,
+        msg_item: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Actually send finish=true for a stream."""
+        stream = self._streams.get(chatid)
+        if not stream or stream.finished:
+            return
+
+        # Cancel timers
+        if stream.finish_timer:
+            stream.finish_timer.cancel()
+            stream.finish_timer = None
+        if stream.throttle_timer:
+            stream.throttle_timer.cancel()
+            stream.throttle_timer = None
+
+        stream.finished = True
+
+        # Include any pending images in msg_item
+        items = msg_item or []
+        for _media_type, img_data in stream.pending_images:
+            b64 = base64.b64encode(img_data).decode("ascii")
+            items.append({"msgtype": "image", "image": {"base64": b64}})
+
+        await self.ws.send_stream(
+            msg_req_id=stream.msg_req_id,
+            stream_id=stream.stream_id,
+            content=stream.content or "✅",
+            finish=True,
+            msg_item=items if items else None,
+        )
+
+    # --- Session monitor callback ---
+
+    async def _on_new_message(self, msg: NewMessage) -> None:
+        """Handle new messages from Claude session monitor."""
+        chatid = self._find_chatid_for_session(msg.session_id)
+        if not chatid:
+            return
+
+        binding = self.wc.groups.get(chatid)
+        if not binding:
+            return
+
+        verbose = binding.verbose
+
+        # Skip user messages
+        if msg.role == "user":
+            return
+
+        # Handle tool messages
+        if msg.content_type in ("tool_use", "tool_result"):
+            if msg.content_type == "tool_use" and msg.tool_name == "Write":
+                file_path = _extract_file_path(msg.text)
+                if file_path and msg.tool_use_id and _is_document_file(file_path):
+                    self._pending_writes[msg.tool_use_id] = file_path
+
+            if msg.content_type == "tool_result" and msg.tool_use_id:
+                file_path = self._pending_writes.pop(msg.tool_use_id, None)
+                if file_path:
+                    p = Path(file_path)
+                    if p.is_file():
+                        sent = await self._send_file_via_app(chatid, file_path)
+                        if sent:
+                            await self._update_stream(
+                                chatid, f"\n\n📄 已发送文件: `{p.name}`"
+                            )
+                        else:
+                            await self._update_stream(
+                                chatid, f"\n\n📄 已写入文件: `{file_path}`"
+                            )
+
+            if verbose:
+                collector = self._tool_collectors.setdefault(chatid, ToolCollector())
+                if msg.content_type == "tool_use":
+                    collector.add(msg.tool_name or "unknown", msg.text)
+            return
+
+        if msg.content_type == "thinking":
+            return
+
+        # Text message from assistant — flush tool collector first
+        if verbose and chatid in self._tool_collectors:
+            summary = self._tool_collectors[chatid].flush()
+            if summary:
+                await self._update_stream(chatid, f"\n\n{summary}")
+
+        # Append assistant text to stream
+        if msg.text:
+            await self._update_stream(chatid, f"\n\n{msg.text}")
+
+        # Collect images for stream finish
+        if msg.image_data:
+            stream = self._streams.get(chatid)
+            if stream and not stream.finished:
+                stream.pending_images.extend(msg.image_data)
+
+    def _find_chatid_for_session(self, session_id: str) -> str | None:
+        """Reverse lookup: session_id → window_id → chatid."""
+        matching_wids: list[str] = [
+            wid
+            for wid, ws in session_manager.window_states.items()
+            if ws.session_id == session_id
+        ]
+        if not matching_wids:
+            return None
+
+        for chatid, binding in self.wc.groups.items():
+            if binding.window_id in matching_wids:
+                return chatid
+        return None
+
+    # --- Window management ---
+
+    async def _ensure_window(
+        self,
+        chatid: str,
+        binding: GroupBinding,
+        resume_session_id: str | None = None,
+    ) -> None:
+        """Ensure a tmux window exists for a group binding."""
+        if binding.window_id:
+            w = await tmux_manager.find_window_by_id(binding.window_id)
+            if w:
+                return
+            binding.window_id = ""
+
+        success, msg, wname, wid = await tmux_manager.create_window(
+            work_dir=binding.cwd,
+            window_name=binding.name or Path(binding.cwd).name,
+            start_claude=True,
+            resume_session_id=resume_session_id,
+        )
+        if success:
+            binding.window_id = wid
+            session_manager.window_display_names[wid] = wname
+            hook_timeout = 15.0 if resume_session_id else 10.0
+            hook_ok = await session_manager.wait_for_session_map_entry(
+                wid, timeout=hook_timeout
+            )
+
+            if resume_session_id:
+                ws = session_manager.get_window_state(wid)
+                if not hook_ok:
+                    ws.session_id = resume_session_id
+                    ws.cwd = binding.cwd
+                    ws.window_name = wname
+                    session_manager._save_state()
+                elif ws.session_id != resume_session_id:
+                    logger.info(
+                        "Resume override: window %s session_id %s -> %s",
+                        wid,
+                        ws.session_id,
+                        resume_session_id,
+                    )
+                    ws.session_id = resume_session_id
+                    session_manager._save_state()
+
+            logger.info(
+                "Created window %s (%s) for chat %s at %s",
+                wid,
+                wname,
+                chatid,
+                binding.cwd,
+            )
+            self.wc.save_groups()
+        else:
+            logger.error("Failed to create window for chat %s: %s", chatid, msg)
+
+    async def _restore_bindings(self) -> None:
+        """Restore window_ids for group bindings by matching against live windows."""
+        windows = await tmux_manager.list_windows()
+        live_ids = {w.window_id for w in windows}
+        name_to_ids: dict[str, list[str]] = {}
+        for w in windows:
+            name_to_ids.setdefault(w.window_name, []).append(w.window_id)
+        used_ids: set[str] = set()
+
+        for chatid, binding in self.wc.groups.items():
+            if binding.window_id:
+                if binding.window_id in live_ids:
+                    used_ids.add(binding.window_id)
+                    continue
+                logger.info(
+                    "Window %s gone for chat %s, will re-match",
+                    binding.window_id,
+                    chatid,
+                )
+                binding.window_id = ""
+
+            dir_name = Path(binding.cwd).name if binding.cwd else ""
+            if dir_name:
+                for wid in name_to_ids.get(dir_name, []):
+                    if wid not in used_ids:
+                        binding.window_id = wid
+                        used_ids.add(wid)
+                        logger.info(
+                            "Restored window for chat %s: %s -> %s",
+                            chatid,
+                            dir_name,
+                            binding.window_id,
+                        )
+                        break
+        self.wc.save_groups()
+
+    # --- Cleanup ---
+
+    async def _cleanup_stale_streams(self) -> None:
+        """Periodically clean up stale stream state."""
+        while True:
+            await asyncio.sleep(STREAM_CLEANUP_INTERVAL)
+            now = time.time()
+            stale = [
+                cid
+                for cid, s in self._streams.items()
+                if s.finished and (now - s.created_at) > STREAM_TTL
+            ]
+            for cid in stale:
+                del self._streams[cid]
+            if stale:
+                logger.debug("Cleaned up %d stale streams", len(stale))
+
+
+def run_wecom_aibot(wecom_config: WeComConfig) -> None:
+    """Entry point: start the WeCom AI Bot with WebSocket long-connection."""
+    bot = WeComAIBot(wecom_config)
+
+    async def _run() -> None:
+        await bot.start()
+        logger.info("WeCom AI Bot started (WebSocket mode)")
+        try:
+            # Keep running until interrupted
+            while True:
+                await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await bot.shutdown()
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        logger.info("WeCom AI Bot stopped")

@@ -53,6 +53,10 @@ class WeComConfig:
         self.callback_token: str = os.getenv("WECOM_CALLBACK_TOKEN", "")
         self.encoding_aes_key: str = os.getenv("WECOM_ENCODING_AES_KEY", "")
 
+        # AI Bot (智能机器人) credentials
+        self.bot_id: str = os.getenv("WECOM_BOT_ID", "")
+        self.bot_secret: str = os.getenv("WECOM_BOT_SECRET", "")
+
         # Webhook server
         self.listen_host: str = os.getenv("WECOM_LISTEN_HOST", "0.0.0.0")
         self.listen_port: int = int(os.getenv("WECOM_LISTEN_PORT", "8080"))
@@ -109,7 +113,7 @@ class WeComConfig:
         return userid in self.allowed_users
 
     def validate(self) -> None:
-        """Validate required config fields."""
+        """Validate required config fields for self-built app mode."""
         missing = []
         if not self.corp_id:
             missing.append("WECOM_CORP_ID")
@@ -123,3 +127,13 @@ class WeComConfig:
             missing.append("WECOM_ENCODING_AES_KEY")
         if missing:
             raise ValueError(f"Missing required WeCom config: {', '.join(missing)}")
+
+    def validate_bot(self) -> None:
+        """Validate required config fields for AI bot (智能机器人) mode."""
+        missing = []
+        if not self.bot_id:
+            missing.append("WECOM_BOT_ID")
+        if not self.bot_secret:
+            missing.append("WECOM_BOT_SECRET")
+        if missing:
+            raise ValueError(f"Missing required WeCom bot config: {', '.join(missing)}")

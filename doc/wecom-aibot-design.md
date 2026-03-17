@@ -402,6 +402,38 @@ ccbot hook        # Hook（不变）
 
 无需新增依赖。`aiohttp`（已在 `[wecom]` optional deps 中）同时支持 HTTP server 和 WebSocket client。
 
+## Stream 更新节流（参考 openclaw-plugin-wecom）
+
+为避免高频 stream 更新导致 WeCom WebSocket 队列溢出，采用节流策略：
+
+- **最小发送间隔 800ms**：两次 `aibot_respond_msg` 之间至少间隔 800ms
+- 如果 content 有更新但距上次发送不足 800ms，设置 delayed send（asyncio.call_later）
+- delayed send 触发时发送当前最新累积内容（自然合并多次小更新）
+
+```python
+@dataclass
+class ChatStream:
+    stream_id: str
+    content: str = ""
+    finished: bool = False
+    last_send_time: float = 0       # 上次发送时间（节流用）
+    pending_images: list = field(default_factory=list)  # base64 图片，finish 时发
+    finish_timer: asyncio.TimerHandle | None = None
+    throttle_timer: asyncio.TimerHandle | None = None   # 节流定时器
+```
+
+## 断线重连待发送队列
+
+WebSocket 断开时，缓存未发送的 stream 更新：
+
+- **TTL 5 分钟**，超时丢弃
+- **最多 50 条**，溢出时丢弃最早的
+- 重连成功后自动重发
+
+## 消息状态 TTL 清理
+
+每个 ChatStream 记录创建时间，定期清理超过 10 分钟未活动的 stream 状态，避免内存泄漏。
+
 ## 已知限制
 
 1. **无法主动推送**：bot 只能在回复用户消息的上下文中发送。如果 Claude 输出时没有活跃的 stream，消息会丢失。实际影响小——用户发消息后 Claude 才开始处理。
@@ -412,11 +444,12 @@ ccbot hook        # Hook（不变）
 
 ## 实施顺序
 
-1. **WebSocket 连接**：ws_client.py — 连接、订阅、心跳、重连
-2. **最小链路**：收到文本消息 → tmux → Claude 输出 → stream 回复
-3. **stream 生命周期**：创建/更新/finish/定时器
-4. **命令处理**：/bind, /unbind, /verbose, /esc, /kill, /history, /screenshot
-5. **交互 UI**：Permission/AskUserQuestion/ExitPlanMode 文本提示
-6. **verbose 模式**：ToolCollector 汇总
-7. **会话恢复**：/bind 时的会话选择器
-8. **媒体操作**：截图(msg_item)、图片接收(URL)、文件/语音接收(可选)
+1. **config.py** — 新增 bot_id/bot_secret 配置 + validate_bot()
+2. **ws_client.py** — WebSocket 连接、订阅、心跳、重连、pending reply queue
+3. **aibot.py** — 最小链路：收文本 → tmux → Claude 输出 → stream 回复
+4. **main.py** — 新增 `ccbot wecom-bot` 入口
+5. **stream 生命周期** — 创建/更新/finish/定时器/节流
+6. **命令处理** — /bind, /unbind, /verbose, /esc, /kill, /history, /screenshot
+7. **交互 UI** — Permission/AskUserQuestion/ExitPlanMode 文本提示
+8. **verbose 模式** — ToolCollector 汇总
+9. **媒体操作** — 截图(msg_item)、图片接收(URL)、文件/语音(可选)
