@@ -373,7 +373,7 @@ class WeComBot:
         if not binding:
             await self._send_text(
                 chat_id,
-                "未绑定工作目录。请使用 /bind <目录路径> 命令绑定。",
+                "Not bound. Use /bind <directory> to bind.",
             )
             return
 
@@ -384,17 +384,17 @@ class WeComBot:
             if sessions:
                 self._pending_session_pick[chat_id] = sessions
                 self._pending_messages[chat_id] = text
-                lines = ["窗口已关闭，发现已有会话。回复数字恢复或输入 0 新建:\n"]
+                lines = ["Window closed. Existing sessions found. Reply number to resume or 0 for new:\n"]
                 for i, s in enumerate(sessions):
                     summary = s.summary[:40] + "…" if len(s.summary) > 40 else s.summary
-                    lines.append(f"**{i + 1}.** {summary} — {s.message_count} 条消息")
-                lines.append("\n**0.** 新建会话")
+                    lines.append(f"**{i + 1}.** {summary} — {s.message_count} msgs")
+                lines.append("\n**0.** New session")
                 await self._send_text(chat_id, "\n".join(lines))
                 return
 
             await self._ensure_window(chat_id, binding)
             if not binding.window_id:
-                await self._send_text(chat_id, "创建窗口失败")
+                await self._send_text(chat_id, "Failed to create window")
                 return
             # Wait briefly for Claude Code to initialize before sending
             await asyncio.sleep(2)
@@ -413,7 +413,7 @@ class WeComBot:
                     binding.window_id, text
                 )
             if not success:
-                await self._send_text(chat_id, f"发送失败: {msg}")
+                await self._send_text(chat_id, f"Send failed: {msg}")
 
     async def _handle_voice_message(
         self, chat_id: str, userid: str, media_id: str
@@ -423,7 +423,7 @@ class WeComBot:
             amr_data = await self.client.download_media(media_id)
         except Exception as e:
             logger.error("Failed to download voice: %s", e)
-            await self._send_text(chat_id, f"语音下载失败: {e}")
+            await self._send_text(chat_id, f"Voice download failed: {e}")
             return
 
         # Convert AMR to MP3 via ffmpeg (OpenAI doesn't support AMR)
@@ -444,7 +444,7 @@ class WeComBot:
                 raise RuntimeError(f"ffmpeg error: {stderr.decode()[:200]}")
         except Exception as e:
             logger.error("Failed to convert voice: %s", e)
-            await self._send_text(chat_id, f"语音转换失败: {e}")
+            await self._send_text(chat_id, f"Voice conversion failed: {e}")
             return
 
         try:
@@ -455,7 +455,7 @@ class WeComBot:
             )
         except Exception as e:
             logger.error("Failed to transcribe voice: %s", e)
-            await self._send_text(chat_id, f"语音转文字失败: {e}")
+            await self._send_text(chat_id, f"Transcription failed: {e}")
             return
 
         logger.info("Voice transcribed for %s: %s", userid, text[:80])
@@ -468,14 +468,14 @@ class WeComBot:
         """Download file from WeCom, save to working directory, and notify Claude."""
         binding = self.wc.groups.get(chat_id)
         if not binding or not binding.cwd:
-            await self._send_text(chat_id, "未绑定工作目录，无法接收文件。")
+            await self._send_text(chat_id, "Not bound. Cannot receive files.")
             return
 
         try:
             data = await self.client.download_media(media_id)
         except Exception as e:
             logger.error("Failed to download file: %s", e)
-            await self._send_text(chat_id, f"文件下载失败: {e}")
+            await self._send_text(chat_id, f"File download failed: {e}")
             return
 
         # Save to uploads/ subdirectory under working directory
@@ -495,15 +495,15 @@ class WeComBot:
             save_path.write_bytes(data)
         except Exception as e:
             logger.error("Failed to save file %s: %s", save_path, e)
-            await self._send_text(chat_id, f"文件保存失败: {e}")
+            await self._send_text(chat_id, f"File save failed: {e}")
             return
 
         logger.info("Saved file %s (%d bytes) for %s", save_path, len(data), userid)
-        await self._send_text(chat_id, f"文件已保存: `{save_path.name}`")
+        await self._send_text(chat_id, f"File saved: `{save_path.name}`")
 
         # Notify Claude about the file
         if binding.window_id:
-            msg = f"用户发送了文件，已保存到: {save_path}"
+            msg = f"User sent a file, saved to: {save_path}"
             await session_manager.send_to_window(binding.window_id, msg)
 
     async def _handle_command(self, chat_id: str, userid: str, text: str) -> None:
@@ -534,19 +534,19 @@ class WeComBot:
             if binding and binding.window_id:
                 await session_manager.send_to_window(binding.window_id, text)
             else:
-                await self._send_text(chat_id, "未知命令。此群未绑定。")
+                await self._send_text(chat_id, "Unknown command. Not bound.")
 
     async def _cmd_bind(self, chat_id: str, path_str: str) -> None:
         """Bind a group to a working directory."""
         if not path_str:
             await self._send_text(
-                chat_id, "用法: /bind <目录路径>\n例如: /bind /home/user/Code/project"
+                chat_id, "Usage: /bind <directory>\nExample: /bind /home/user/Code/project"
             )
             return
 
         path = Path(path_str).expanduser().resolve()
         if not path.is_dir():
-            await self._send_text(chat_id, f"目录不存在: {path}")
+            await self._send_text(chat_id, f"Directory not found: {path}")
             return
 
         # Check for existing sessions in this directory
@@ -560,13 +560,13 @@ class WeComBot:
             self.wc.save_groups()
 
             lines = [
-                f"**已绑定到 {path}**\n",
-                "发现已有会话，回复数字恢复或输入 0 新建:\n",
+                f"**Bound to {path}**\n",
+                "Existing sessions found. Reply number to resume or 0 for new:\n",
             ]
             for i, s in enumerate(sessions):
                 summary = s.summary[:40] + "…" if len(s.summary) > 40 else s.summary
-                lines.append(f"**{i + 1}.** {summary} — {s.message_count} 条消息")
-            lines.append("\n**0.** 新建会话")
+                lines.append(f"**{i + 1}.** {summary} — {s.message_count} msgs")
+            lines.append("\n**0.** New session")
             await self._send_text(chat_id, "\n".join(lines))
             return
 
@@ -575,7 +575,7 @@ class WeComBot:
         self.wc.groups[chat_id] = binding
         self.wc.save_groups()
 
-        await self._send_text(chat_id, f"已绑定到 {path}")
+        await self._send_text(chat_id, f"Bound to {path}")
 
         # Create window and start Claude
         await self._ensure_window(chat_id, binding)
@@ -587,26 +587,26 @@ class WeComBot:
             if binding.window_id:
                 await tmux_manager.kill_window(binding.window_id)
             self.wc.save_groups()
-            await self._send_text(chat_id, "已解绑")
+            await self._send_text(chat_id, "Unbound")
         else:
-            await self._send_text(chat_id, "此群未绑定")
+            await self._send_text(chat_id, "Not bound")
 
     async def _cmd_verbose(self, chat_id: str) -> None:
         """Toggle verbose mode for a group."""
         binding = self.wc.groups.get(chat_id)
         if not binding:
-            await self._send_text(chat_id, "此群未绑定")
+            await self._send_text(chat_id, "Not bound")
             return
         binding.verbose = not binding.verbose
         self.wc.save_groups()
-        status = "开启" if binding.verbose else "关闭"
-        await self._send_text(chat_id, f"详细模式已{status}")
+        status = "ON" if binding.verbose else "OFF"
+        await self._send_text(chat_id, f"Verbose mode {status}")
 
     async def _cmd_esc(self, chat_id: str) -> None:
         """Send Escape to the bound window."""
         binding = self.wc.groups.get(chat_id)
         if not binding or not binding.window_id:
-            await self._send_text(chat_id, "此群未绑定或窗口不存在")
+            await self._send_text(chat_id, "Not bound or window not found")
             return
         await tmux_manager.send_keys(
             binding.window_id, "Escape", enter=False, literal=False
@@ -616,17 +616,17 @@ class WeComBot:
         """Capture and send terminal screenshot."""
         binding = self.wc.groups.get(chat_id)
         if not binding or not binding.window_id:
-            await self._send_text(chat_id, "此群未绑定或窗口不存在")
+            await self._send_text(chat_id, "Not bound or window not found")
             return
 
         pane_text = await tmux_manager.capture_pane(binding.window_id, with_ansi=True)
         if not pane_text:
-            await self._send_text(chat_id, "截图失败")
+            await self._send_text(chat_id, "Screenshot capture failed")
             return
 
         img_data = await text_to_image(pane_text, with_ansi=True)
         if not img_data:
-            await self._send_text(chat_id, "渲染失败")
+            await self._send_text(chat_id, "Render failed")
             return
 
         try:
@@ -636,28 +636,28 @@ class WeComBot:
             await self._send_image(chat_id, media_id)
         except Exception as e:
             logger.error("Failed to send screenshot: %s", e)
-            await self._send_text(chat_id, f"截图发送失败: {e}")
+            await self._send_text(chat_id, f"Screenshot send failed: {e}")
 
     async def _cmd_kill(self, chat_id: str) -> None:
         """Kill the tmux window for a group."""
         binding = self.wc.groups.get(chat_id)
         if not binding or not binding.window_id:
-            await self._send_text(chat_id, "此群未绑定或窗口不存在")
+            await self._send_text(chat_id, "Not bound or window not found")
             return
         await tmux_manager.kill_window(binding.window_id)
         binding.window_id = ""
-        await self._send_text(chat_id, "窗口已关闭")
+        await self._send_text(chat_id, "Window killed")
 
     async def _cmd_history(self, chat_id: str) -> None:
         """Show recent message history as plain text."""
         binding = self.wc.groups.get(chat_id)
         if not binding or not binding.window_id:
-            await self._send_text(chat_id, "此群未绑定或窗口不存在")
+            await self._send_text(chat_id, "Not bound or window not found")
             return
 
         messages, total = await session_manager.get_recent_messages(binding.window_id)
         if not messages:
-            await self._send_text(chat_id, "暂无历史消息")
+            await self._send_text(chat_id, "No message history")
             return
 
         # Show last 10 messages
@@ -671,20 +671,20 @@ class WeComBot:
             lines.append(f"{role} {text}")
 
         await self._send_text(
-            chat_id, f"最近 {len(recent)} 条消息:\n\n" + "\n\n".join(lines)
+            chat_id, f"Last {len(recent)} messages:\n\n" + "\n\n".join(lines)
         )
 
     async def _cmd_file(self, chat_id: str, path_str: str) -> None:
         """Send a file from the bound working directory."""
         if not path_str:
             await self._send_text(
-                chat_id, "用法: /file <文件路径>\n例如: /file output/report.docx"
+                chat_id, "Usage: /file <path>\nExample: /file output/report.docx"
             )
             return
 
         binding = self.wc.groups.get(chat_id)
         if not binding:
-            await self._send_text(chat_id, "未绑定工作目录")
+            await self._send_text(chat_id, "Not bound")
             return
 
         # Resolve path relative to bound working directory
@@ -694,14 +694,14 @@ class WeComBot:
         file_path = file_path.resolve()
 
         if not file_path.is_file():
-            await self._send_text(chat_id, f"文件不存在: {file_path}")
+            await self._send_text(chat_id, f"File not found: {file_path}")
             return
 
         # 20MB limit for WeCom file upload
         size = file_path.stat().st_size
         if size > 20 * 1024 * 1024:
             await self._send_text(
-                chat_id, f"文件过大 ({size // 1024 // 1024}MB)，限制20MB"
+                chat_id, f"File too large ({size // 1024 // 1024}MB), limit 20MB"
             )
             return
 
@@ -711,7 +711,7 @@ class WeComBot:
             await self._send_file(chat_id, media_id)
         except Exception as e:
             logger.error("Failed to send file %s: %s", file_path, e)
-            await self._send_text(chat_id, f"发送文件失败: {e}")
+            await self._send_text(chat_id, f"File send failed: {e}")
 
     async def _handle_session_pick(self, chat_id: str, choice: int) -> None:
         """Handle session picker numeric reply."""
@@ -722,7 +722,7 @@ class WeComBot:
             return
 
         if choice < 0 or choice > len(sessions):
-            await self._send_text(chat_id, f"无效选择，请输入 0-{len(sessions)}")
+            await self._send_text(chat_id, f"Invalid choice, enter 0-{len(sessions)}")
             self._pending_session_pick[chat_id] = sessions
             if pending_text:
                 self._pending_messages[chat_id] = pending_text
@@ -730,10 +730,10 @@ class WeComBot:
 
         resume_id: str | None = None
         if choice == 0 or not sessions:
-            await self._send_text(chat_id, "新建会话...")
+            await self._send_text(chat_id, "Creating new session...")
         else:
             selected = sessions[choice - 1]
-            await self._send_text(chat_id, f"恢复会话: {selected.summary[:50]}")
+            await self._send_text(chat_id, f"Resuming session: {selected.summary[:50]}")
             resume_id = selected.session_id
 
         await self._ensure_window(chat_id, binding, resume_session_id=resume_id)
