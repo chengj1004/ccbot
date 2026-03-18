@@ -296,12 +296,23 @@ class WeComAIBot:
                 )
 
         elif msgtype == "mixed":
-            # Mixed messages (image + text) — extract text part
+            # Mixed messages (image + text) — handle both parts
             items = body.get("mixed", {}).get("items", [])
             text_parts = []
+            image_urls = []
             for item in items:
                 if item.get("msgtype") == "text":
                     text_parts.append(item.get("text", {}).get("content", ""))
+                elif item.get("msgtype") == "image":
+                    url = item.get("image", {}).get("url", "")
+                    if url:
+                        image_urls.append(url)
+            # Process images
+            for url in image_urls:
+                asyncio.create_task(
+                    self._handle_image_message(chatid, userid, url)
+                )
+            # Process text
             if text_parts:
                 combined = "\n".join(text_parts)
                 await self._handle_text_message(chatid, userid, combined)
