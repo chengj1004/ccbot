@@ -144,6 +144,9 @@ class WeComAIBot:
         # Per-chat state
         self._streams: dict[str, ChatStream] = {}  # chatid → active stream
         self._chat_req_ids: dict[str, str] = {}  # chatid → latest msg_req_id
+        self._chat_last_user: dict[
+            str, str
+        ] = {}  # chatid → last userid (for file sending)
         self._tool_collectors: dict[str, ToolCollector] = {}
         self._pending_messages: dict[
             str, str
@@ -248,9 +251,11 @@ class WeComAIBot:
             msg_req_id[:20] if msg_req_id else "none",
         )
 
-        # Store the latest msg_req_id for this chat (needed for stream replies)
+        # Store the latest msg_req_id and userid for this chat
         if msg_req_id:
             self._chat_req_ids[chatid] = msg_req_id
+        if userid:
+            self._chat_last_user[chatid] = userid
 
         if msgtype == "text":
             content = body.get("text", {}).get("content", "")
@@ -307,6 +312,22 @@ class WeComAIBot:
         """Process an incoming text message."""
         # Strip invisible Unicode chars that WeCom may insert
         text = text.strip("\u200b\u200c\u200d\u2060\ufeff")
+
+        # Strip @bot mention prefix in group chats
+        # Bot name may contain spaces (e.g. "@AI Workbench /bind /path")
+        if not chatid.startswith("dm:") and text.startswith("@"):
+            if self.wc.bot_name:
+                # Use configured bot name for precise stripping
+                prefix = f"@{self.wc.bot_name}"
+                if text.startswith(prefix):
+                    text = text[len(prefix) :].lstrip()
+            else:
+                # Fallback: find first "/" (command) or strip @word
+                cmd_match = re.search(r"(?:^|\s)(/\S)", text)
+                if cmd_match:
+                    text = text[cmd_match.start(1) :]
+                else:
+                    text = re.sub(r"^@\S+\s*", "", text)
 
         # Handle pending session picker
         if chatid in self._pending_session_pick and text.strip().isdigit():
@@ -535,7 +556,7 @@ class WeComAIBot:
         elif cmd == "/history":
             await self._cmd_history(chatid)
         elif cmd == "/file":
-            await self._cmd_file(chatid, arg)
+            await self._cmd_file(chatid, arg, userid)
         else:
             # Forward unknown /commands to Claude as-is
             binding = self.wc.groups.get(chatid)
@@ -668,7 +689,7 @@ class WeComAIBot:
             chatid, f"Last {len(recent)} messages:\n\n" + "\n\n".join(lines)
         )
 
-    async def _cmd_file(self, chatid: str, path_str: str) -> None:
+    async def _cmd_file(self, chatid: str, path_str: str, userid: str = "") -> None:
         if not path_str:
             await self._stream_reply(chatid, "Usage: /file <path>")
             return
@@ -690,7 +711,7 @@ class WeComAIBot:
             await self._stream_reply(chatid, f"File not found: {file_path}")
             return
 
-        sent = await self._send_file_via_app(chatid, str(file_path))
+        sent = await self._send_file_via_app(chatid, str(file_path), userid)
         if sent:
             await self._stream_reply(chatid, f"📄 File sent: `{file_path.name}`")
         else:
@@ -712,8 +733,14 @@ class WeComAIBot:
         """Check if file sending via self-built app API is available."""
         return self._media_client is not None and self.wc.agent_id != 0
 
-    async def _send_file_via_app(self, chatid: str, file_path: str) -> bool:
-        """Send a file to user via self-built app API. Returns True if successful."""
+    async def _send_file_via_app(
+        self, chatid: str, file_path: str, userid: str = ""
+    ) -> bool:
+        """Send a file to user via self-built app API. Returns True if successful.
+
+        For DM chats, sends to the DM user. For group chats, sends to the
+        specified userid (falls back to last known user for the chat).
+        """
         if not self._can_send_files():
             return False
 
@@ -726,21 +753,25 @@ class WeComAIBot:
             logger.warning("File too large for sending: %s (%d bytes)", file_path, size)
             return False
 
+        # Resolve target userid
+        target_userid = ""
+        if chatid.startswith("dm:"):
+            target_userid = chatid.removeprefix("dm:")
+        elif userid:
+            target_userid = userid
+        else:
+            # Try last known user for this chat
+            target_userid = self._chat_last_user.get(chatid, "")
+
+        if not target_userid:
+            logger.warning("No userid to send file to for chat %s", chatid)
+            return False
+
         try:
             data = p.read_bytes()
             media_id = await self._media_client.upload_media("file", data, p.name)
-            # Determine target: DM uses message/send, group not supported via app API
-            if chatid.startswith("dm:"):
-                userid = chatid.removeprefix("dm:")
-                await self._media_client.send_file_to_user(userid, media_id)
-            else:
-                # For group chats, send to all allowed users as DM
-                # (app API can't send to bot group chats directly)
-                logger.warning(
-                    "File sending to group %s not supported, skipping", chatid
-                )
-                return False
-            logger.info("Sent file %s to %s via app API", p.name, chatid)
+            await self._media_client.send_file_to_user(target_userid, media_id)
+            logger.info("Sent file %s to user %s via app API", p.name, target_userid)
             return True
         except Exception as e:
             logger.error("Failed to send file %s via app API: %s", file_path, e)

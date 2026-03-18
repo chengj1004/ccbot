@@ -56,6 +56,7 @@ class WeComConfig:
         # AI Bot (智能机器人) credentials
         self.bot_id: str = os.getenv("WECOM_BOT_ID", "")
         self.bot_secret: str = os.getenv("WECOM_BOT_SECRET", "")
+        self.bot_name: str = os.getenv("WECOM_BOT_NAME", "")
 
         # Webhook server
         self.listen_host: str = os.getenv("WECOM_LISTEN_HOST", "0.0.0.0")
