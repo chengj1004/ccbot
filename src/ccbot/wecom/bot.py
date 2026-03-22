@@ -478,8 +478,8 @@ class WeComBot:
             await self._send_text(chat_id, f"File download failed: {e}")
             return
 
-        # Save to uploads/ subdirectory under working directory
-        save_dir = Path(binding.cwd) / "uploads"
+        # Save to .files/ subdirectory under working directory
+        save_dir = Path(binding.cwd) / ".files"
         save_dir.mkdir(exist_ok=True)
         save_path = save_dir / file_name
         # Avoid overwriting: add suffix if file exists

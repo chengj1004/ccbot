@@ -482,7 +482,7 @@ class WeComAIBot:
             await self._stream_reply(chatid, f"Image download failed: {e}")
             return
 
-        save_dir = Path(binding.cwd) / "uploads"
+        save_dir = Path(binding.cwd) / ".files"
         save_dir.mkdir(exist_ok=True)
         save_path = save_dir / f"image_{uuid.uuid4().hex[:8]}.jpg"
 
@@ -521,7 +521,7 @@ class WeComAIBot:
             await self._stream_reply(chatid, f"File download failed: {e}")
             return
 
-        save_dir = Path(binding.cwd) / "uploads"
+        save_dir = Path(binding.cwd) / ".files"
         save_dir.mkdir(exist_ok=True)
         save_path = save_dir / file_name
         if save_path.exists():
