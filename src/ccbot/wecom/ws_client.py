@@ -60,6 +60,7 @@ class WeComWSClient:
         self._message_callback: MessageCallback | None = None
         self._connected = False
         self._closing = False
+        self._reconnecting = False  # Guard against concurrent reconnects
         self._reconnect_attempts = 0
         self._last_pong_time: float = 0
         self._missed_pongs = 0
@@ -80,6 +81,7 @@ class WeComWSClient:
     async def connect(self) -> None:
         """Establish WebSocket connection, authenticate, and start background loops."""
         self._closing = False
+        self._reconnecting = False
         self._session = aiohttp.ClientSession()
         await self._connect_ws()
 
@@ -256,7 +258,7 @@ class WeComWSClient:
                     logger.warning(
                         "Missed %d pongs, triggering reconnect", self._missed_pongs
                     )
-                    asyncio.create_task(self._reconnect())
+                    await self._reconnect()
                     return
 
                 # Send ping
@@ -271,7 +273,7 @@ class WeComWSClient:
             except Exception as e:
                 if not self._closing:
                     logger.error("Ping loop error: %s", e)
-                    asyncio.create_task(self._reconnect())
+                    await self._reconnect()
                 return
 
     async def _receive_loop(self) -> None:
@@ -308,7 +310,7 @@ class WeComWSClient:
         if not self._closing:
             logger.warning("WebSocket disconnected, scheduling reconnect")
             self._connected = False
-            await self._schedule_reconnect()
+            await self._reconnect()
 
     async def _handle_frame(self, data: dict[str, Any]) -> None:
         """Route a received frame to the appropriate handler."""
@@ -350,10 +352,18 @@ class WeComWSClient:
         logger.debug("Unhandled frame: %s", json.dumps(data, ensure_ascii=False)[:200])
 
     async def _reconnect(self) -> None:
-        """Close current connection and reconnect."""
+        """Close current connection and reconnect.
+
+        Uses _reconnecting flag to prevent concurrent reconnect attempts
+        from ping_loop and receive_loop racing each other.
+        """
+        if self._reconnecting or self._closing:
+            return
+        self._reconnecting = True
         self._connected = False
         await self._close_ws()
         await self._schedule_reconnect()
+        self._reconnecting = False
 
     async def _schedule_reconnect(self) -> None:
         """Reconnect with exponential backoff."""
