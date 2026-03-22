@@ -497,7 +497,9 @@ class WeComAIBot:
         await self._stream_reply(chatid, f"Image saved: `{save_path.name}`")
 
         if binding.window_id:
-            msg = f"User sent an image file (do not read it), saved to: {save_path}"
+            # Only send the filename, not the full path — Claude Code
+            # auto-attaches image files when it sees a path in the message
+            msg = f"[User uploaded image: {save_path.name}]"
             await session_manager.send_to_window(binding.window_id, msg)
 
     async def _handle_file_message(
