@@ -96,13 +96,19 @@ def _decrypt_media(encrypted_data: bytes, aeskey_b64: str) -> bytes:
     """Decrypt WeCom media using per-message AES key.
 
     Uses AES-256-CBC with IV = first 16 bytes of key.
-    PKCS#7 padding with 32-byte block size (non-standard, must unpad manually).
+    PKCS#7 padding with 32-byte block size (non-standard).
+    Must disable auto-padding since cryptography lib expects 16-byte blocks.
     """
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.ciphers.algorithms import AES
+    from cryptography.hazmat.primitives.ciphers.modes import CBC
 
-    key = base64.b64decode(aeskey_b64)
+    # Pad base64 string if needed (WeCom may omit trailing '=')
+    padded_b64 = aeskey_b64 + "=" * (-len(aeskey_b64) % 4)
+    key = base64.b64decode(padded_b64)
     iv = key[:16]
-    cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
+    # Decrypt without auto-padding — we handle PKCS#7 (32-byte block) manually
+    cipher = Cipher(AES(key), CBC(iv))
     decryptor = cipher.decryptor()
     decrypted = decryptor.update(encrypted_data) + decryptor.finalize()
     # Manual PKCS#7 unpad with 32-byte block size
@@ -508,9 +514,16 @@ class WeComAIBot:
         # Decrypt if aeskey is provided (WS mode encrypts media with per-message AES)
         if aeskey:
             try:
+                logger.debug(
+                    "Decrypting image: %d bytes, aeskey=%s..., first16=%s",
+                    len(data),
+                    aeskey[:10],
+                    data[:16].hex() if data else "empty",
+                )
                 data = _decrypt_media(data, aeskey)
+                logger.debug("Decrypted image: %d bytes, first4=%s", len(data), data[:4].hex())
             except Exception as e:
-                logger.error("Failed to decrypt image: %s", e)
+                logger.error("Failed to decrypt image (%d bytes): %s", len(data), e, exc_info=True)
                 await self._stream_reply(chatid, f"Image decrypt failed: {e}")
                 return
 
