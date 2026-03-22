@@ -2,6 +2,7 @@
 
 import pytest
 
+from ccbot.config import config
 from ccbot.session import SessionManager
 
 
@@ -9,6 +10,16 @@ from ccbot.session import SessionManager
 def mgr(monkeypatch) -> SessionManager:
     monkeypatch.setattr(SessionManager, "_load_state", lambda self: None)
     monkeypatch.setattr(SessionManager, "_save_state", lambda self: None)
+    monkeypatch.setattr(config, "shared_binding", False)
+    return SessionManager()
+
+
+@pytest.fixture
+def shared_mgr(monkeypatch) -> SessionManager:
+    """SessionManager with shared_binding=True."""
+    monkeypatch.setattr(SessionManager, "_load_state", lambda self: None)
+    monkeypatch.setattr(SessionManager, "_save_state", lambda self: None)
+    monkeypatch.setattr(config, "shared_binding", True)
     return SessionManager()
 
 
@@ -155,3 +166,49 @@ class TestIsWindowId:
         assert mgr._is_window_id("@") is False
         assert mgr._is_window_id("") is False
         assert mgr._is_window_id("@abc") is False
+
+
+class TestSharedBindThread:
+    def test_bind_and_get_ignores_user_id(self, shared_mgr: SessionManager) -> None:
+        shared_mgr.bind_thread(100, 1, "@1")
+        # Any user can look up the same binding
+        assert shared_mgr.get_window_for_thread(100, 1) == "@1"
+        assert shared_mgr.get_window_for_thread(200, 1) == "@1"
+
+    def test_bind_stores_in_shared_dict(self, shared_mgr: SessionManager) -> None:
+        shared_mgr.bind_thread(100, 1, "@1")
+        assert shared_mgr.shared_thread_bindings == {1: "@1"}
+        # Per-user bindings remain empty
+        assert shared_mgr.thread_bindings == {}
+
+    def test_unbind_shared(self, shared_mgr: SessionManager) -> None:
+        shared_mgr.bind_thread(100, 1, "@1")
+        result = shared_mgr.unbind_thread(200, 1)  # user_id ignored
+        assert result == "@1"
+        assert shared_mgr.get_window_for_thread(100, 1) is None
+
+    def test_unbind_nonexistent_returns_none(self, shared_mgr: SessionManager) -> None:
+        assert shared_mgr.unbind_thread(100, 999) is None
+
+    def test_iter_shared_bindings(self, shared_mgr: SessionManager) -> None:
+        shared_mgr.bind_thread(100, 1, "@1")
+        shared_mgr.bind_thread(200, 2, "@2")
+        result = set(shared_mgr.iter_thread_bindings())
+        # user_id=0 as placeholder in shared mode
+        assert result == {(0, 1, "@1"), (0, 2, "@2")}
+
+    def test_resolve_window_for_thread_shared(self, shared_mgr: SessionManager) -> None:
+        shared_mgr.bind_thread(100, 42, "@3")
+        # Any user can resolve
+        assert shared_mgr.resolve_window_for_thread(200, 42) == "@3"
+
+    def test_set_group_chat_id_stores_shared_key(
+        self, shared_mgr: SessionManager
+    ) -> None:
+        shared_mgr.set_group_chat_id(100, 42, -1001234567890)
+        # Regular key exists
+        assert shared_mgr.group_chat_ids["100:42"] == -1001234567890
+        # Shared key "0:42" also exists for status polling
+        assert shared_mgr.group_chat_ids["0:42"] == -1001234567890
+        # resolve_chat_id works with user_id=0
+        assert shared_mgr.resolve_chat_id(0, 42) == -1001234567890

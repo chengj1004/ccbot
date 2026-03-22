@@ -101,6 +101,12 @@ class Config:
             os.getenv("CCBOT_SHOW_HIDDEN_DIRS", "").lower() == "true"
         )
 
+        # Shared topic binding mode: all allowed users share the same
+        # topic→window mapping (bindings keyed by thread_id only)
+        self.shared_binding: bool = (
+            os.getenv("CCBOT_SHARED_BINDING", "").lower() == "true"
+        )
+
         # OpenAI API for voice message transcription (optional)
         self.openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
         self.openai_base_url: str = os.getenv(
