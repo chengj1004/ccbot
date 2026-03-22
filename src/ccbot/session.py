@@ -99,6 +99,8 @@ class SessionManager:
     window_states: dict[str, WindowState] = field(default_factory=dict)
     user_window_offsets: dict[int, dict[str, int]] = field(default_factory=dict)
     thread_bindings: dict[int, dict[int, str]] = field(default_factory=dict)
+    # Shared binding mode: thread_id -> window_id (no user key)
+    shared_thread_bindings: dict[int, str] = field(default_factory=dict)
     # window_id -> display name (window_name)
     window_display_names: dict[str, str] = field(default_factory=dict)
     # "user_id:thread_id" -> group chat_id (for supergroup forum topic routing)
@@ -123,6 +125,9 @@ class SessionManager:
             "thread_bindings": {
                 str(uid): {str(tid): wid for tid, wid in bindings.items()}
                 for uid, bindings in self.thread_bindings.items()
+            },
+            "shared_thread_bindings": {
+                str(tid): wid for tid, wid in self.shared_thread_bindings.items()
             },
             "window_display_names": self.window_display_names,
             "group_chat_ids": self.group_chat_ids,
@@ -154,6 +159,10 @@ class SessionManager:
                 self.thread_bindings = {
                     int(uid): {int(tid): wid for tid, wid in bindings.items()}
                     for uid, bindings in state.get("thread_bindings", {}).items()
+                }
+                self.shared_thread_bindings = {
+                    int(tid): wid
+                    for tid, wid in state.get("shared_thread_bindings", {}).items()
                 }
                 self.window_display_names = state.get("window_display_names", {})
                 self.group_chat_ids = {
@@ -187,6 +196,7 @@ class SessionManager:
                 self.window_states = {}
                 self.user_window_offsets = {}
                 self.thread_bindings = {}
+                self.shared_thread_bindings = {}
                 self.window_display_names = {}
                 self.group_chat_ids = {}
                 pass
@@ -302,6 +312,47 @@ class SessionManager:
         empty_users = [uid for uid, b in self.thread_bindings.items() if not b]
         for uid in empty_users:
             del self.thread_bindings[uid]
+
+        # --- Migrate shared_thread_bindings ---
+        new_shared: dict[int, str] = {}
+        for tid, val in self.shared_thread_bindings.items():
+            if self._is_window_id(val):
+                if val in live_ids:
+                    new_shared[tid] = val
+                else:
+                    display = self.window_display_names.get(val, val)
+                    new_id = live_by_name.get(display)
+                    if new_id:
+                        logger.info(
+                            "Re-resolved shared thread binding %s -> %s (name=%s)",
+                            val,
+                            new_id,
+                            display,
+                        )
+                        new_shared[tid] = new_id
+                        self.window_display_names[new_id] = display
+                        changed = True
+                    else:
+                        logger.info(
+                            "Dropping stale shared thread binding: thread=%d, wid=%s",
+                            tid,
+                            val,
+                        )
+                        changed = True
+            else:
+                new_id = live_by_name.get(val)
+                if new_id:
+                    new_shared[tid] = new_id
+                    self.window_display_names[new_id] = val
+                    changed = True
+                else:
+                    logger.info(
+                        "Dropping old-format shared thread binding: thread=%d, name=%s",
+                        tid,
+                        val,
+                    )
+                    changed = True
+        self.shared_thread_bindings = new_shared
 
         # --- Migrate user_window_offsets ---
         for uid, offsets in self.user_window_offsets.items():
@@ -426,21 +477,33 @@ class SessionManager:
         Telegram's Bot API rejects message_thread_id when chat_id is a private
         user ID — the thread only exists within the group context.
 
+        In shared binding mode, also stores under key "0:{thread_id}" so that
+        status polling (which uses user_id=0) can resolve the chat_id.
+
         DO NOT REMOVE this method or the group_chat_ids mapping.
         Without it, all outbound messages in forum topics fail with
         "Message thread not found". See commit history: 5afc111 → 26cb81f → PR #23.
         """
         tid = thread_id or 0
         key = f"{user_id}:{tid}"
+        changed = False
         if self.group_chat_ids.get(key) != chat_id:
             self.group_chat_ids[key] = chat_id
-            self._save_state()
+            changed = True
             logger.debug(
                 "Stored group chat_id: user=%d, thread=%s, chat_id=%d",
                 user_id,
                 thread_id,
                 chat_id,
             )
+        # In shared mode, store under "0:thread_id" for status polling lookup
+        if config.shared_binding and user_id != 0 and thread_id:
+            shared_key = f"0:{tid}"
+            if self.group_chat_ids.get(shared_key) != chat_id:
+                self.group_chat_ids[shared_key] = chat_id
+                changed = True
+        if changed:
+            self._save_state()
 
     def resolve_chat_id(self, user_id: int, thread_id: int | None = None) -> int:
         """Resolve the correct chat_id for sending messages.
@@ -727,28 +790,43 @@ class SessionManager:
         """Bind a Telegram topic thread to a tmux window.
 
         Args:
-            user_id: Telegram user ID
+            user_id: Telegram user ID (ignored in shared binding mode)
             thread_id: Telegram topic thread ID
             window_id: Tmux window ID (e.g. '@0')
             window_name: Display name for the window (optional)
         """
-        if user_id not in self.thread_bindings:
-            self.thread_bindings[user_id] = {}
-        self.thread_bindings[user_id][thread_id] = window_id
+        if config.shared_binding:
+            self.shared_thread_bindings[thread_id] = window_id
+        else:
+            if user_id not in self.thread_bindings:
+                self.thread_bindings[user_id] = {}
+            self.thread_bindings[user_id][thread_id] = window_id
         if window_name:
             self.window_display_names[window_id] = window_name
         self._save_state()
         display = window_name or self.get_display_name(window_id)
         logger.info(
-            "Bound thread %d -> window_id %s (%s) for user %d",
+            "Bound thread %d -> window_id %s (%s) for user %d%s",
             thread_id,
             window_id,
             display,
             user_id,
+            " (shared)" if config.shared_binding else "",
         )
 
     def unbind_thread(self, user_id: int, thread_id: int) -> str | None:
-        """Remove a thread binding. Returns the previously bound window_id, or None."""
+        """Remove a thread binding. Returns the previously bound window_id, or None.
+
+        In shared binding mode, user_id is ignored — binding is keyed by thread_id only.
+        """
+        if config.shared_binding:
+            window_id = self.shared_thread_bindings.pop(thread_id, None)
+            if window_id is None:
+                return None
+            self._save_state()
+            logger.info("Unbound shared thread %d (was %s)", thread_id, window_id)
+            return window_id
+
         bindings = self.thread_bindings.get(user_id)
         if not bindings or thread_id not in bindings:
             return None
@@ -765,7 +843,12 @@ class SessionManager:
         return window_id
 
     def get_window_for_thread(self, user_id: int, thread_id: int) -> str | None:
-        """Look up the window_id bound to a thread."""
+        """Look up the window_id bound to a thread.
+
+        In shared binding mode, user_id is ignored — lookup by thread_id only.
+        """
+        if config.shared_binding:
+            return self.shared_thread_bindings.get(thread_id)
         bindings = self.thread_bindings.get(user_id)
         if not bindings:
             return None
@@ -789,7 +872,14 @@ class SessionManager:
 
         Provides encapsulated access to thread_bindings without exposing
         the internal data structure directly.
+
+        In shared binding mode, yields user_id=0 as a placeholder since
+        bindings are not per-user.
         """
+        if config.shared_binding:
+            for thread_id, window_id in self.shared_thread_bindings.items():
+                yield 0, thread_id, window_id
+            return
         for user_id, bindings in self.thread_bindings.items():
             for thread_id, window_id in bindings.items():
                 yield user_id, thread_id, window_id
@@ -801,8 +891,19 @@ class SessionManager:
         """Find all users whose thread-bound window maps to the given session_id.
 
         Returns list of (user_id, window_id, thread_id) tuples.
+
+        In shared binding mode, returns all allowed_users paired with matching
+        thread_ids so every user gets notifications.
         """
         result: list[tuple[int, str, int]] = []
+        if config.shared_binding:
+            for thread_id, window_id in self.shared_thread_bindings.items():
+                resolved = await self.resolve_session_for_window(window_id)
+                if resolved and resolved.session_id == session_id:
+                    # One entry per topic — message sent once to the shared topic
+                    result.append((0, window_id, thread_id))
+            return result
+
         for user_id, thread_id, window_id in self.iter_thread_bindings():
             resolved = await self.resolve_session_for_window(window_id)
             if resolved and resolved.session_id == session_id:

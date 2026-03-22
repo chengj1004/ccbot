@@ -119,3 +119,26 @@ class TestConfigOpenAI:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-secret")
         Config()
         assert os.environ.get("OPENAI_API_KEY") is None
+
+
+@pytest.mark.usefixtures("_base_env")
+class TestConfigSharedBinding:
+    def test_shared_binding_default_false(self, monkeypatch):
+        monkeypatch.delenv("CCBOT_SHARED_BINDING", raising=False)
+        cfg = Config()
+        assert cfg.shared_binding is False
+
+    def test_shared_binding_true(self, monkeypatch):
+        monkeypatch.setenv("CCBOT_SHARED_BINDING", "true")
+        cfg = Config()
+        assert cfg.shared_binding is True
+
+    def test_shared_binding_case_insensitive(self, monkeypatch):
+        monkeypatch.setenv("CCBOT_SHARED_BINDING", "True")
+        cfg = Config()
+        assert cfg.shared_binding is True
+
+    def test_shared_binding_false_explicit(self, monkeypatch):
+        monkeypatch.setenv("CCBOT_SHARED_BINDING", "false")
+        cfg = Config()
+        assert cfg.shared_binding is False
