@@ -497,7 +497,7 @@ class WeComAIBot:
         await self._stream_reply(chatid, f"Image saved: `{save_path.name}`")
 
         if binding.window_id:
-            msg = f"User sent an image, saved to: {save_path}"
+            msg = f"User sent an image file (do not read it), saved to: {save_path}"
             await session_manager.send_to_window(binding.window_id, msg)
 
     async def _handle_file_message(
@@ -1096,8 +1096,8 @@ class WeComAIBot:
             if summary:
                 await self._update_stream(chatid, f"\n\n{summary}")
 
-        # Append assistant text to stream
-        if msg.text:
+        # Append assistant text to stream (skip non-substantive replies)
+        if msg.text and msg.text.strip() not in ("No response requested.",):
             await self._update_stream(chatid, f"\n\n{msg.text}")
 
         # Collect images for stream finish
