@@ -93,19 +93,23 @@ def _extract_document_paths(text: str) -> list[str]:
 
 
 def _decrypt_media(encrypted_data: bytes, aeskey_b64: str) -> bytes:
-    """Decrypt WeCom media using per-message AES key (AES-256-CBC, PKCS7)."""
+    """Decrypt WeCom media using per-message AES key.
+
+    Uses AES-256-CBC with IV = first 16 bytes of key.
+    PKCS#7 padding with 32-byte block size (non-standard, must unpad manually).
+    """
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    from cryptography.hazmat.primitives.padding import PKCS7
 
     key = base64.b64decode(aeskey_b64)
-    # IV is the first 16 bytes of the key
     iv = key[:16]
     cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
     decryptor = cipher.decryptor()
     decrypted = decryptor.update(encrypted_data) + decryptor.finalize()
-    # Remove PKCS7 padding
-    unpadder = PKCS7(128).unpadder()
-    return unpadder.update(decrypted) + unpadder.finalize()
+    # Manual PKCS#7 unpad with 32-byte block size
+    pad_len = decrypted[-1]
+    if pad_len < 1 or pad_len > 32:
+        raise ValueError(f"Invalid PKCS#7 padding value: {pad_len}")
+    return decrypted[:-pad_len]
 
 
 @dataclass
