@@ -17,6 +17,7 @@ Key function: run_wecom_aibot().
 
 import asyncio
 import base64
+import json
 import logging
 import re
 import time
@@ -297,7 +298,8 @@ class WeComAIBot:
 
         elif msgtype == "mixed":
             # Mixed messages (image + text) — handle both parts
-            items = body.get("mixed", {}).get("items", [])
+            # WS mode uses "msg_item" (not "items") for mixed content
+            items = body.get("mixed", {}).get("msg_item", [])
             text_parts = []
             image_urls = []
             for item in items:
