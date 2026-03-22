@@ -93,6 +93,7 @@ ALLOWED_USERS=your_telegram_user_id
 | `CLAUDE_COMMAND` | `claude` | Команда запуска в новых окнах |
 | `MONITOR_POLL_INTERVAL` | `2.0` | Интервал опроса в секундах |
 | `CCBOT_SHOW_HIDDEN_DIRS` | `false` | Показывать скрытые (dot) директории в браузере каталогов |
+| `CCBOT_SHARED_BINDING` | `false` | Общая привязка топиков: все разрешённые пользователи используют одну привязку топик→сессия |
 | `OPENAI_API_KEY` | _(нет)_ | API-ключ OpenAI для транскрипции голосовых сообщений |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Базовый URL OpenAI API (для прокси или совместимых API) |
 
