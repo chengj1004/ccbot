@@ -17,7 +17,6 @@ Key function: run_wecom_aibot().
 
 import asyncio
 import base64
-import json
 import logging
 import re
 import time
@@ -91,6 +90,22 @@ def _extract_document_paths(text: str) -> list[str]:
         if _is_document_file(candidate) and Path(candidate).is_file():
             paths.append(candidate)
     return paths
+
+
+def _decrypt_media(encrypted_data: bytes, aeskey_b64: str) -> bytes:
+    """Decrypt WeCom media using per-message AES key (AES-256-CBC, PKCS7)."""
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.padding import PKCS7
+
+    key = base64.b64decode(aeskey_b64)
+    # IV is the first 16 bytes of the key
+    iv = key[:16]
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
+    decryptor = cipher.decryptor()
+    decrypted = decryptor.update(encrypted_data) + decryptor.finalize()
+    # Remove PKCS7 padding
+    unpadder = PKCS7(128).unpadder()
+    return unpadder.update(decrypted) + unpadder.finalize()
 
 
 @dataclass
@@ -276,11 +291,12 @@ class WeComAIBot:
                 )
 
         elif msgtype == "image":
-            # Images come with a URL in WS mode
+            # Images come with a URL (and optional aeskey) in WS mode
             image_url = body.get("image", {}).get("url", "")
+            aeskey = body.get("image", {}).get("aeskey", "")
             if image_url:
                 asyncio.create_task(
-                    self._handle_image_message(chatid, userid, image_url)
+                    self._handle_image_message(chatid, userid, image_url, aeskey)
                 )
 
         elif msgtype == "file":
@@ -301,18 +317,19 @@ class WeComAIBot:
             # WS mode uses "msg_item" (not "items") for mixed content
             items = body.get("mixed", {}).get("msg_item", [])
             text_parts = []
-            image_urls = []
+            images = []  # list of (url, aeskey)
             for item in items:
                 if item.get("msgtype") == "text":
                     text_parts.append(item.get("text", {}).get("content", ""))
                 elif item.get("msgtype") == "image":
                     url = item.get("image", {}).get("url", "")
+                    aeskey = item.get("image", {}).get("aeskey", "")
                     if url:
-                        image_urls.append(url)
+                        images.append((url, aeskey))
             # Process images
-            for url in image_urls:
+            for url, aeskey in images:
                 asyncio.create_task(
-                    self._handle_image_message(chatid, userid, url)
+                    self._handle_image_message(chatid, userid, url, aeskey)
                 )
             # Process text
             if text_parts:
@@ -463,9 +480,9 @@ class WeComAIBot:
         await self._handle_text_message(chatid, userid, text)
 
     async def _handle_image_message(
-        self, chatid: str, userid: str, image_url: str
+        self, chatid: str, userid: str, image_url: str, aeskey: str = ""
     ) -> None:
-        """Download image from URL, save to working directory, notify Claude."""
+        """Download image from URL, decrypt if needed, save and notify Claude."""
         binding = self.wc.groups.get(chatid)
         if not binding or not binding.cwd:
             await self._stream_reply(chatid, "Not bound. Cannot receive images.")
@@ -484,6 +501,15 @@ class WeComAIBot:
             await self._stream_reply(chatid, f"Image download failed: {e}")
             return
 
+        # Decrypt if aeskey is provided (WS mode encrypts media with per-message AES)
+        if aeskey:
+            try:
+                data = _decrypt_media(data, aeskey)
+            except Exception as e:
+                logger.error("Failed to decrypt image: %s", e)
+                await self._stream_reply(chatid, f"Image decrypt failed: {e}")
+                return
+
         save_dir = Path(binding.cwd) / ".files"
         save_dir.mkdir(exist_ok=True)
         save_path = save_dir / f"image_{uuid.uuid4().hex[:8]}.jpg"
@@ -499,9 +525,7 @@ class WeComAIBot:
         await self._stream_reply(chatid, f"Image saved: `{save_path.name}`")
 
         if binding.window_id:
-            # Only send the filename, not the full path — Claude Code
-            # auto-attaches image files when it sees a path in the message
-            msg = f"[User uploaded image: {save_path.name}]"
+            msg = f"User sent an image, saved to: {save_path}"
             await session_manager.send_to_window(binding.window_id, msg)
 
     async def _handle_file_message(
