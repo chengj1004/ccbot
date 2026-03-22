@@ -24,6 +24,7 @@ CCBot 让你**通过 Telegram 无缝接管同一个会话**。核心设计思路
 - **实时通知** — 接收助手回复、思考过程、工具调用/结果、本地命令输出的 Telegram 消息
 - **交互式 UI** — 通过内联键盘操作 AskUserQuestion、ExitPlanMode 和权限提示
 - **语音消息** — 语音消息通过 OpenAI 转录为文字并转发
+- **文件上传** — 发送图片和文档（xlsx、pdf、csv 等），保存到项目目录并转发给 Claude Code
 - **发送消息** — 通过 tmux 按键将文字转发给 Claude Code
 - **斜杠命令转发** — 任何 `/command` 直接发送给 Claude Code（如 `/clear`、`/compact`、`/cost`）
 - **创建新会话** — 通过目录浏览器从 Telegram 启动 Claude Code 会话
