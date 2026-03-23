@@ -310,12 +310,25 @@ class WeComAIBot:
                 )
 
         elif msgtype == "file":
-            if self._media_client:
-                media_id = body.get("file", {}).get("media_id", "")
-                file_name = body.get("file", {}).get("file_name", "file")
+            file_info = body.get("file", {})
+            file_url = file_info.get("url", "")
+            file_aeskey = file_info.get("aeskey", "")
+            file_name = file_info.get("file_name", "")
+            if file_url:
+                # WS mode: download from URL + decrypt with aeskey
+                asyncio.create_task(
+                    self._handle_file_url_message(
+                        chatid, userid, file_url, file_aeskey, file_name
+                    )
+                )
+            elif self._media_client:
+                # Fallback: media_id mode (if ever used)
+                media_id = file_info.get("media_id", "")
                 if media_id:
                     asyncio.create_task(
-                        self._handle_file_message(chatid, userid, media_id, file_name)
+                        self._handle_file_message(
+                            chatid, userid, media_id, file_name or "file"
+                        )
                     )
             else:
                 await self._stream_reply(
@@ -543,6 +556,79 @@ class WeComAIBot:
 
         if binding.window_id:
             msg = f"User sent an image, saved to: {save_path}"
+            await session_manager.send_to_window(binding.window_id, msg)
+
+    async def _handle_file_url_message(
+        self,
+        chatid: str,
+        userid: str,
+        file_url: str,
+        aeskey: str = "",
+        file_name: str = "",
+    ) -> None:
+        """Download file from URL, decrypt if needed, save and notify Claude."""
+        binding = self.wc.groups.get(chatid)
+        if not binding or not binding.cwd:
+            await self._stream_reply(chatid, "Not bound. Cannot receive files.")
+            return
+
+        try:
+            import aiohttp
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(file_url) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"HTTP {resp.status}")
+                    data = await resp.read()
+                    # Try to get filename from Content-Disposition header
+                    if not file_name:
+                        cd = resp.headers.get("Content-Disposition", "")
+                        if "filename=" in cd:
+                            file_name = cd.split("filename=")[-1].strip("\"' ")
+        except Exception as e:
+            logger.error("Failed to download file: %s", e)
+            await self._stream_reply(chatid, f"File download failed: {e}")
+            return
+
+        if aeskey:
+            try:
+                data = _decrypt_media(data, aeskey)
+            except Exception as e:
+                logger.error("Failed to decrypt file: %s", e)
+                await self._stream_reply(chatid, f"File decrypt failed: {e}")
+                return
+
+        if not file_name:
+            file_name = f"file_{uuid.uuid4().hex[:8]}"
+        else:
+            # URL-decode filename (WeCom may encode Chinese chars)
+            from urllib.parse import unquote
+
+            file_name = unquote(file_name)
+
+        save_dir = Path(binding.cwd) / ".files"
+        save_dir.mkdir(exist_ok=True)
+        save_path = save_dir / file_name
+        if save_path.exists():
+            stem = save_path.stem
+            suffix = save_path.suffix
+            i = 1
+            while save_path.exists():
+                save_path = save_dir / f"{stem}_{i}{suffix}"
+                i += 1
+
+        try:
+            save_path.write_bytes(data)
+        except Exception as e:
+            logger.error("Failed to save file %s: %s", save_path, e)
+            await self._stream_reply(chatid, f"File save failed: {e}")
+            return
+
+        logger.info("Saved file %s (%d bytes) for %s", save_path, len(data), userid)
+        await self._stream_reply(chatid, f"File saved: `{save_path.name}`")
+
+        if binding.window_id:
+            msg = f"User sent a file, saved to: {save_path}"
             await session_manager.send_to_window(binding.window_id, msg)
 
     async def _handle_file_message(
