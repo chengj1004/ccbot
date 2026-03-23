@@ -6,16 +6,18 @@ TMUX_WINDOW="__main__"
 TARGET="${TMUX_SESSION}:${TMUX_WINDOW}"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 MAX_WAIT=10  # seconds to wait for process to exit
+MODE="${1:-}"  # optional: "wecom" for WeCom bot mode
 
-# Check if tmux session and window exist
+# Check if tmux session exists
 if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     echo "Error: tmux session '$TMUX_SESSION' does not exist"
     exit 1
 fi
 
+# Create __main__ window if it doesn't exist
 if ! tmux list-windows -t "$TMUX_SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "$TMUX_WINDOW"; then
-    echo "Error: window '$TMUX_WINDOW' not found in session '$TMUX_SESSION'"
-    exit 1
+    echo "Creating window '$TMUX_WINDOW'..."
+    tmux new-window -t "$TMUX_SESSION" -n "$TMUX_WINDOW" -d
 fi
 
 # Get the pane PID and check if uv run ccbot is running
@@ -62,8 +64,12 @@ fi
 sleep 1
 
 # Start ccbot
-echo "Starting ccbot in $TARGET..."
-tmux send-keys -t "$TARGET" "cd ${PROJECT_DIR} && uv run ccbot" Enter
+CMD="cd ${PROJECT_DIR} && uv run ccbot"
+if [ "$MODE" = "wecom" ]; then
+    CMD="$CMD wecom"
+fi
+echo "Starting ccbot${MODE:+ ($MODE)} in $TARGET..."
+tmux send-keys -t "$TARGET" "$CMD" Enter
 
 # Verify startup and show logs
 sleep 3
