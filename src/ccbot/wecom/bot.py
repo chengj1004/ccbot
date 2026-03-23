@@ -304,7 +304,7 @@ class WeComBot:
                 msg_type,
                 (content or "")[:80],
             )
-            logger.debug("Decrypted XML: %s", xml_content[:500])
+            logger.debug("Decrypted XML: %s", xml_content[:2000])
 
             if msg_type == "voice":
                 media_id = root.findtext("MediaId", "")
@@ -349,6 +349,9 @@ class WeComBot:
                         )
                     )
 
+            else:
+                logger.warning("Unhandled MsgType: %s, XML: %s", msg_type, xml_content[:2000])
+
         except ET.ParseError as e:
             logger.error("Failed to parse message XML: %s", e)
 
@@ -379,25 +382,11 @@ class WeComBot:
 
         # Ensure tmux window exists
         if not binding.window_id:
-            # Check if window was killed externally
-            sessions = await session_manager.list_sessions_for_directory(binding.cwd)
-            if sessions:
-                self._pending_session_pick[chat_id] = sessions
-                self._pending_messages[chat_id] = text
-                lines = ["Window closed. Existing sessions found. Reply number to resume or 0 for new:\n"]
-                for i, s in enumerate(sessions):
-                    summary = s.summary[:40] + "…" if len(s.summary) > 40 else s.summary
-                    lines.append(f"**{i + 1}.** {summary} — {s.message_count} msgs")
-                lines.append("\n**0.** New session")
-                await self._send_text(chat_id, "\n".join(lines))
-                return
-
-            await self._ensure_window(chat_id, binding)
-            if not binding.window_id:
-                await self._send_text(chat_id, "Failed to create window")
-                return
-            # Wait briefly for Claude Code to initialize before sending
-            await asyncio.sleep(2)
+            await self._send_text(
+                chat_id,
+                "Window closed. Use /bind <directory> to rebind.",
+            )
+            return
 
         # Send text to tmux window
         success, msg = await session_manager.send_to_window(binding.window_id, text)
