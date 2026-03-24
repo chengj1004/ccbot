@@ -180,6 +180,9 @@ class WeComAIBot:
         self._pending_messages: dict[
             str, str
         ] = {}  # chatid → text (during window creation)
+        self._pending_content: dict[
+            str, str
+        ] = {}  # chatid → buffered content (no req_id yet)
         self._pending_session_pick: dict[str, list[Any]] = {}
         self._pending_interactive: dict[
             str, str
@@ -436,8 +439,10 @@ class WeComAIBot:
                 return
             await asyncio.sleep(2)
 
-        # Create stream placeholder and send to tmux
-        await self._create_stream(chatid, "⏳")
+        # Create stream placeholder — include any buffered content from before
+        pending = self._pending_content.pop(chatid, "")
+        initial = f"⏳{pending}" if pending else "⏳"
+        await self._create_stream(chatid, initial)
 
         # Track which chat last sent to this window (for reply routing)
         self._window_last_chat[binding.window_id] = chatid
@@ -1076,6 +1081,10 @@ class WeComAIBot:
         if not stream or stream.finished:
             # No active stream — create one
             stream = await self._create_stream(chatid, append_text)
+            if not stream:
+                # No msg_req_id — buffer content for when user sends next message
+                self._pending_content.setdefault(chatid, "")
+                self._pending_content[chatid] += append_text
             return
 
         stream.content += append_text
