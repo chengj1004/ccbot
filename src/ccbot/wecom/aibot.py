@@ -1193,6 +1193,12 @@ class WeComAIBot:
         if not chatid:
             chatid = self._find_chatid_for_session(msg.session_id)
         if not chatid:
+            logger.debug(
+                "No chatid for session %s (window_states=%s, window_last_chat=%s)",
+                msg.session_id[:12],
+                list(session_manager.window_states.keys()),
+                list(self._window_last_chat.keys()),
+            )
             return
 
         binding = self.wc.groups.get(chatid)
