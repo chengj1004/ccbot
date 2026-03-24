@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 # Stream update throttle: minimum interval between sends (ms)
 STREAM_THROTTLE_MS = 800
 # Stream auto-finish delay after last content update (seconds)
-STREAM_FINISH_DELAY = 5.0
+STREAM_FINISH_DELAY = 30.0
 # Stream content byte limit (WeCom limit is 20480, leave margin)
 STREAM_MAX_BYTES = 19000
 # Stale stream cleanup interval and TTL
@@ -1211,8 +1211,9 @@ class WeComAIBot:
         if msg.role == "user":
             return
 
-        # Handle tool messages
+        # Handle tool messages — reset finish timer to keep stream alive during tool execution
         if msg.content_type in ("tool_use", "tool_result"):
+            self._reset_finish_timer(chatid)
             if msg.content_type == "tool_use" and msg.tool_name == "Write":
                 file_path = _extract_file_path(msg.text)
                 if file_path and msg.tool_use_id and _is_document_file(file_path):
@@ -1240,6 +1241,7 @@ class WeComAIBot:
             return
 
         if msg.content_type == "thinking":
+            self._reset_finish_timer(chatid)
             return
 
         # Text message from assistant — flush tool collector first
@@ -1259,15 +1261,21 @@ class WeComAIBot:
                 stream.pending_images.extend(msg.image_data)
 
     def _find_chatid_for_session(self, session_id: str) -> str | None:
-        """Reverse lookup: session_id → window_id → chatid."""
-        matching_wids: list[str] = [
+        """Reverse lookup: session_id → window_id → chatid.
+
+        When multiple windows share the same session_id (e.g. after window
+        recreation), prefer the window_id that has an active group binding.
+        """
+        # Collect all window_ids with this session_id
+        matching_wids: set[str] = {
             wid
             for wid, ws in session_manager.window_states.items()
             if ws.session_id == session_id
-        ]
+        }
         if not matching_wids:
             return None
 
+        # Find chatid from group bindings — only match bound window_ids
         for chatid, binding in self.wc.groups.items():
             if binding.window_id in matching_wids:
                 return chatid
