@@ -1185,13 +1185,20 @@ class WeComAIBot:
         # First try window_last_chat (most accurate — tracks which chat
         # last sent a message to this window), then fall back to reverse lookup
         chatid = None
+        # 1. Try window_last_chat (most accurate for this bot instance)
         for wid, ws in session_manager.window_states.items():
             if ws.session_id == msg.session_id:
                 chatid = self._window_last_chat.get(wid)
                 if chatid:
                     break
+        # 2. Fall back to reverse lookup via group bindings
         if not chatid:
             chatid = self._find_chatid_for_session(msg.session_id)
+        # 3. Last resort: check session_map directly for window_id,
+        #    then match against group bindings (handles race conditions
+        #    where window_states hasn't been updated yet)
+        if not chatid:
+            chatid = self._find_chatid_from_session_map(msg.session_id)
         if not chatid:
             logger.debug(
                 "No chatid for session %s (window_states=%s, window_last_chat=%s)",
@@ -1279,6 +1286,31 @@ class WeComAIBot:
         for chatid, binding in self.wc.groups.items():
             if binding.window_id in matching_wids:
                 return chatid
+        return None
+
+    def _find_chatid_from_session_map(self, session_id: str) -> str | None:
+        """Last-resort lookup: read session_map.json directly to find window_id."""
+        try:
+            from ..config import config
+
+            map_path = config.config_dir / "session_map.json"
+            if not map_path.exists():
+                return None
+            import json
+
+            session_map = json.loads(map_path.read_text())
+            prefix = f"{config.tmux_session_name}:"
+            for key, info in session_map.items():
+                if not key.startswith(prefix):
+                    continue
+                if info.get("session_id") == session_id:
+                    wid = key[len(prefix) :]
+                    # Match against group bindings
+                    for chatid, binding in self.wc.groups.items():
+                        if binding.window_id == wid:
+                            return chatid
+        except Exception as e:
+            logger.debug("_find_chatid_from_session_map error: %s", e)
         return None
 
     # --- Window management ---
