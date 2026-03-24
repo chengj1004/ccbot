@@ -173,6 +173,9 @@ class WeComAIBot:
         self._chat_last_user: dict[
             str, str
         ] = {}  # chatid → last userid (for file sending)
+        self._window_last_chat: dict[
+            str, str
+        ] = {}  # window_id → last chatid that sent a message
         self._tool_collectors: dict[str, ToolCollector] = {}
         self._pending_messages: dict[
             str, str
@@ -435,6 +438,9 @@ class WeComAIBot:
 
         # Create stream placeholder and send to tmux
         await self._create_stream(chatid, "⏳")
+
+        # Track which chat last sent to this window (for reply routing)
+        self._window_last_chat[binding.window_id] = chatid
 
         success, msg = await session_manager.send_to_window(binding.window_id, text)
         if not success:
@@ -1176,7 +1182,16 @@ class WeComAIBot:
 
     async def _on_new_message(self, msg: NewMessage) -> None:
         """Handle new messages from Claude session monitor."""
-        chatid = self._find_chatid_for_session(msg.session_id)
+        # First try window_last_chat (most accurate — tracks which chat
+        # last sent a message to this window), then fall back to reverse lookup
+        chatid = None
+        for wid, ws in session_manager.window_states.items():
+            if ws.session_id == msg.session_id:
+                chatid = self._window_last_chat.get(wid)
+                if chatid:
+                    break
+        if not chatid:
+            chatid = self._find_chatid_for_session(msg.session_id)
         if not chatid:
             return
 
