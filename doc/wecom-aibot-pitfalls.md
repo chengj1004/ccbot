@@ -122,7 +122,25 @@ After restart:
 
 ### Silent Disconnection
 
-Long-idle connections may stop receiving messages even though ping/pong works normally. The WeCom server may expire the message routing internally. **Restarting the bot (new subscribe) fixes this.**
+Long-idle connections may stop receiving messages even though ping/pong works normally. The WeCom server may expire the message routing internally. Observed after ~11 hours of no user messages, but exact timeout is unknown.
+
+**Mitigation:** Periodic forced reconnect every 2 hours (`PERIODIC_RECONNECT_INTERVAL = 7200`). The bot disconnects, reconnects, and re-subscribes automatically. Log message: `Periodic reconnect: forcing re-subscribe after 7200s`.
+
+### Debugging Connection Issues
+
+Key log patterns to grep:
+
+| Pattern | Meaning |
+|---------|---------|
+| `Message from` | User message received by bot |
+| `WebSocket subscribed successfully` | Connection established and authenticated |
+| `Periodic reconnect` | Scheduled re-subscribe triggered |
+| `No chatid for session` | Reply routing failed (check window_states/window_last_chat) |
+| `Cannot create stream` | No msg_req_id — user hasn't sent a message since restart |
+| `WebSocket disconnected` | Connection lost, reconnecting |
+| `Missed N pongs` | Heartbeat failure, triggering reconnect |
+| `errcode=846605` | Invalid req_id (wrong frame format) |
+| `errcode=846608` | Expired req_id (stream already finished or timed out) |
 
 ### Pending Reply Queue
 
