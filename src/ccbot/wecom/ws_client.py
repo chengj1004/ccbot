@@ -31,6 +31,9 @@ RECONNECT_BASE_DELAY = 5  # seconds
 RECONNECT_MAX_DELAY = 60  # seconds
 PENDING_REPLY_TTL = 300  # 5 minutes
 PENDING_REPLY_MAX = 50
+PERIODIC_RECONNECT_INTERVAL = (
+    7200  # 2 hours — force re-subscribe to prevent stale routing
+)
 
 
 @dataclass
@@ -66,6 +69,7 @@ class WeComWSClient:
         self._missed_pongs = 0
         self._ping_task: asyncio.Task[None] | None = None
         self._receive_task: asyncio.Task[None] | None = None
+        self._periodic_reconnect_task: asyncio.Task[None] | None = None
         self._pending_replies: deque[PendingReply] = deque(maxlen=PENDING_REPLY_MAX)
         # Track ack callbacks for sent commands
         self._ack_futures: dict[str, asyncio.Future[dict[str, Any]]] = {}
@@ -84,6 +88,11 @@ class WeComWSClient:
         self._reconnecting = False
         self._session = aiohttp.ClientSession()
         await self._connect_ws()
+        # Start periodic reconnect to prevent stale message routing
+        if not self._periodic_reconnect_task or self._periodic_reconnect_task.done():
+            self._periodic_reconnect_task = asyncio.create_task(
+                self._periodic_reconnect_loop()
+            )
 
     async def _connect_ws(self) -> None:
         """Internal: connect, subscribe, and start ping/receive loops."""
@@ -351,6 +360,23 @@ class WeComWSClient:
 
         logger.debug("Unhandled frame: %s", json.dumps(data, ensure_ascii=False)[:200])
 
+    async def _periodic_reconnect_loop(self) -> None:
+        """Periodically force a reconnect to prevent stale message routing.
+
+        WeCom may stop delivering messages after long idle periods even though
+        ping/pong works. A fresh subscribe fixes this.
+        """
+        while not self._closing:
+            await asyncio.sleep(PERIODIC_RECONNECT_INTERVAL)
+            if self._closing:
+                break
+            if self._connected:
+                logger.info(
+                    "Periodic reconnect: forcing re-subscribe after %ds",
+                    PERIODIC_RECONNECT_INTERVAL,
+                )
+                await self._reconnect()
+
     async def _reconnect(self) -> None:
         """Close current connection and reconnect.
 
@@ -399,6 +425,9 @@ class WeComWSClient:
         """Graceful shutdown."""
         self._closing = True
         self._connected = False
+        if self._periodic_reconnect_task and not self._periodic_reconnect_task.done():
+            self._periodic_reconnect_task.cancel()
+            self._periodic_reconnect_task = None
         await self._close_ws()
         if self._session:
             await self._session.close()
