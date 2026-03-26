@@ -367,15 +367,24 @@ class WeComWSClient:
         ping/pong works. A fresh subscribe fixes this.
         """
         while not self._closing:
-            await asyncio.sleep(PERIODIC_RECONNECT_INTERVAL)
-            if self._closing:
+            try:
+                await asyncio.sleep(PERIODIC_RECONNECT_INTERVAL)
+                if self._closing:
+                    break
+                if self._connected:
+                    logger.info(
+                        "Periodic reconnect: forcing re-subscribe after %ds",
+                        PERIODIC_RECONNECT_INTERVAL,
+                    )
+                    await self._reconnect()
+                else:
+                    logger.debug("Periodic reconnect skipped: not connected")
+            except asyncio.CancelledError:
                 break
-            if self._connected:
-                logger.info(
-                    "Periodic reconnect: forcing re-subscribe after %ds",
-                    PERIODIC_RECONNECT_INTERVAL,
-                )
-                await self._reconnect()
+            except Exception as e:
+                logger.error("Periodic reconnect loop error: %s", e)
+                # Continue the loop — don't let a single failure kill it
+                await asyncio.sleep(60)
 
     async def _reconnect(self) -> None:
         """Close current connection and reconnect.
