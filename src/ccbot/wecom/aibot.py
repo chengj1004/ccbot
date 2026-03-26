@@ -99,7 +99,7 @@ def _decrypt_media(encrypted_data: bytes, aeskey_b64: str) -> bytes:
     PKCS#7 padding with 32-byte block size (non-standard).
     Must disable auto-padding since cryptography lib expects 16-byte blocks.
     """
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.ciphers import Cipher
     from cryptography.hazmat.primitives.ciphers.algorithms import AES
     from cryptography.hazmat.primitives.ciphers.modes import CBC
 
@@ -545,9 +545,16 @@ class WeComAIBot:
                     data[:16].hex() if data else "empty",
                 )
                 data = _decrypt_media(data, aeskey)
-                logger.debug("Decrypted image: %d bytes, first4=%s", len(data), data[:4].hex())
+                logger.debug(
+                    "Decrypted image: %d bytes, first4=%s", len(data), data[:4].hex()
+                )
             except Exception as e:
-                logger.error("Failed to decrypt image (%d bytes): %s", len(data), e, exc_info=True)
+                logger.error(
+                    "Failed to decrypt image (%d bytes): %s",
+                    len(data),
+                    e,
+                    exc_info=True,
+                )
                 await self._stream_reply(chatid, f"Image decrypt failed: {e}")
                 return
 
@@ -1380,7 +1387,13 @@ class WeComAIBot:
             logger.error("Failed to create window for chat %s: %s", chatid, msg)
 
     async def _restore_bindings(self) -> None:
-        """Restore window_ids for group bindings by matching against live windows."""
+        """Restore window_ids for group bindings by matching against live windows.
+
+        Three-pass matching:
+        1. Validate existing window_ids (keep if window still alive, clear if gone)
+        2. Match by session_map.json (cwd-based, most reliable for recreated windows)
+        3. Fall back to window name matching (dir name → window name)
+        """
         windows = await tmux_manager.list_windows()
         live_ids = {w.window_id for w in windows}
         name_to_ids: dict[str, list[str]] = {}
@@ -1388,6 +1401,26 @@ class WeComAIBot:
             name_to_ids.setdefault(w.window_name, []).append(w.window_id)
         used_ids: set[str] = set()
 
+        # Build cwd→window_id map from session_map.json
+        cwd_to_wids: dict[str, list[str]] = {}
+        try:
+            from ..config import config
+            import json
+
+            map_path = config.config_dir / "session_map.json"
+            if map_path.exists():
+                session_map = json.loads(map_path.read_text())
+                prefix = f"{config.tmux_session_name}:"
+                for key, info in session_map.items():
+                    if key.startswith(prefix):
+                        wid = key[len(prefix) :]
+                        cwd = info.get("cwd", "")
+                        if wid in live_ids and cwd:
+                            cwd_to_wids.setdefault(cwd, []).append(wid)
+        except Exception as e:
+            logger.warning("Failed to load session_map for restore: %s", e)
+
+        # Pass 1: validate existing window_ids
         for chatid, binding in self.wc.groups.items():
             if binding.window_id:
                 if binding.window_id in live_ids:
@@ -1400,19 +1433,44 @@ class WeComAIBot:
                 )
                 binding.window_id = ""
 
-            dir_name = Path(binding.cwd).name if binding.cwd else ""
-            if dir_name:
-                for wid in name_to_ids.get(dir_name, []):
+        # Pass 2 & 3: re-match unbound chats
+        for chatid, binding in self.wc.groups.items():
+            if binding.window_id:
+                continue  # Already matched in pass 1
+
+            matched = False
+
+            # Try session_map (cwd match)
+            if binding.cwd:
+                for wid in cwd_to_wids.get(binding.cwd, []):
                     if wid not in used_ids:
                         binding.window_id = wid
                         used_ids.add(wid)
                         logger.info(
-                            "Restored window for chat %s: %s -> %s",
+                            "Restored window for chat %s via session_map: cwd=%s -> %s",
                             chatid,
-                            dir_name,
-                            binding.window_id,
+                            binding.cwd,
+                            wid,
                         )
+                        matched = True
                         break
+
+            # Fall back to window name match
+            if not matched:
+                dir_name = Path(binding.cwd).name if binding.cwd else ""
+                if dir_name:
+                    for wid in name_to_ids.get(dir_name, []):
+                        if wid not in used_ids:
+                            binding.window_id = wid
+                            used_ids.add(wid)
+                            logger.info(
+                                "Restored window for chat %s via name: %s -> %s",
+                                chatid,
+                                dir_name,
+                                wid,
+                            )
+                            break
+
         self.wc.save_groups()
 
     # --- Cleanup ---
