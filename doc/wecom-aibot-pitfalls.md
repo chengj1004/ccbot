@@ -120,11 +120,32 @@ After restart:
 - Use a `_reconnecting` flag to ensure only one reconnect flow runs at a time.
 - Exponential backoff: `delay = min(5 * 2^attempts, 60)` seconds.
 
-### Silent Disconnection
+### receive_loop / reconnect Deadlock (Critical Bug Found)
 
-Long-idle connections may stop receiving messages even though ping/pong works normally. The WeCom server may expire the message routing internally. Observed after ~11 hours of no user messages, but exact timeout is unknown.
+**Root cause of most "bot stops receiving messages" incidents.** When the WS connection drops, `receive_loop` detects the disconnect and triggers reconnection. The critical mistake is calling `await self._reconnect()` directly from `receive_loop`:
 
-**Mitigation:** Periodic forced reconnect every 2 hours (`PERIODIC_RECONNECT_INTERVAL = 7200`). The bot disconnects, reconnects, and re-subscribes automatically. Log message: `Periodic reconnect: forcing re-subscribe after 7200s`.
+```
+receive_loop detects disconnect
+  → await _reconnect()
+    → _close_ws()
+      → cancel _receive_task  (which IS receive_loop itself!)
+        → receive_loop gets CancelledError
+          → _reconnect() chain is aborted
+            → _reconnecting = True forever
+              → ALL future reconnects blocked
+```
+
+**Fix:** `receive_loop` must use `asyncio.create_task(self._reconnect())` instead of `await`, so the reconnect runs independently and `_close_ws()` can safely cancel the receive task without killing the reconnect chain.
+
+This bug was initially misdiagnosed as "WeCom message routing expiration" because the symptoms looked similar — periodic reconnect masked the issue by creating fresh connections, but whenever the WS connection dropped naturally between periodic reconnects, the deadlock killed all reconnection capability.
+
+### Periodic Reconnect (Safety Net)
+
+Force re-subscribe every 30 minutes (`PERIODIC_RECONNECT_INTERVAL = 1800`) as an additional safety net. Even with the deadlock fix, periodic reconnect helps ensure the connection stays fresh.
+
+- The periodic reconnect loop has exception protection — a single failure won't kill the loop.
+- Log message: `Periodic reconnect: forcing re-subscribe after 1800s`.
+- If the log shows `Periodic reconnect skipped: not connected`, the bot is disconnected and reconnection has stalled — investigate the reconnect logic.
 
 ### Debugging Connection Issues
 
@@ -135,10 +156,13 @@ Key log patterns to grep:
 | `Message from` | User message received by bot |
 | `WebSocket subscribed successfully` | Connection established and authenticated |
 | `Periodic reconnect` | Scheduled re-subscribe triggered |
+| `Periodic reconnect skipped: not connected` | **Red flag** — bot is stuck disconnected |
+| `Periodic reconnect loop error` | Exception in the periodic loop |
 | `No chatid for session` | Reply routing failed (check window_states/window_last_chat) |
 | `Cannot create stream` | No msg_req_id — user hasn't sent a message since restart |
 | `WebSocket disconnected` | Connection lost, reconnecting |
 | `Missed N pongs` | Heartbeat failure, triggering reconnect |
+| `Reconnecting in Ns (attempt N)` | Should be followed by `connected` or `connect failed` |
 | `errcode=846605` | Invalid req_id (wrong frame format) |
 | `errcode=846608` | Expired req_id (stream already finished or timed out) |
 
