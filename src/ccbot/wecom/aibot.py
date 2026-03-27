@@ -871,7 +871,7 @@ class WeComAIBot:
             await self._stream_reply(chatid, f"File not found: {file_path}")
             return
 
-        sent = await self._send_file_via_app(chatid, str(file_path), userid)
+        sent, err = await self._send_file_via_app(chatid, str(file_path), userid)
         if sent:
             await self._stream_reply(chatid, f"📄 File sent: `{file_path.name}`")
         else:
@@ -884,7 +884,7 @@ class WeComAIBot:
             await self._stream_reply(
                 chatid,
                 f"📄 File: `{file_path}`\nSize: {size_str}\n\n"
-                "⚠️ File sending requires WECOM_AGENT_ID.",
+                f"⚠️ File send failed: {err}",
             )
 
     # --- File sending via self-built app API ---
@@ -895,23 +895,22 @@ class WeComAIBot:
 
     async def _send_file_via_app(
         self, chatid: str, file_path: str, userid: str = ""
-    ) -> bool:
-        """Send a file to user via self-built app API. Returns True if successful.
+    ) -> tuple[bool, str]:
+        """Send a file to user via self-built app API.
 
-        For DM chats, sends to the DM user. For group chats, sends to the
-        specified userid (falls back to last known user for the chat).
+        Returns (success, error_message). error_message is empty on success.
         """
         if not self._can_send_files():
-            return False
+            return False, "WECOM_AGENT_ID not configured"
 
         p = Path(file_path)
         if not p.is_file():
-            return False
+            return False, "File not found"
 
         size = p.stat().st_size
         if size > 20 * 1024 * 1024:
             logger.warning("File too large for sending: %s (%d bytes)", file_path, size)
-            return False
+            return False, "File too large (max 20MB)"
 
         # Resolve target userid
         target_userid = ""
@@ -920,22 +919,21 @@ class WeComAIBot:
         elif userid:
             target_userid = userid
         else:
-            # Try last known user for this chat
             target_userid = self._chat_last_user.get(chatid, "")
 
         if not target_userid:
             logger.warning("No userid to send file to for chat %s", chatid)
-            return False
+            return False, "No target user"
 
         try:
             data = p.read_bytes()
             media_id = await self._media_client.upload_media("file", data, p.name)
             await self._media_client.send_file_to_user(target_userid, media_id)
             logger.info("Sent file %s to user %s via app API", p.name, target_userid)
-            return True
+            return True, ""
         except Exception as e:
             logger.error("Failed to send file %s via app API: %s", file_path, e)
-            return False
+            return False, str(e)
 
     # --- Session picker ---
 
@@ -1247,7 +1245,7 @@ class WeComAIBot:
                 if file_path:
                     p = Path(file_path)
                     if p.is_file():
-                        sent = await self._send_file_via_app(chatid, file_path)
+                        sent, _err = await self._send_file_via_app(chatid, file_path)
                         if sent:
                             await self._update_stream(
                                 chatid, f"\n\n📄 File sent: `{p.name}`"
