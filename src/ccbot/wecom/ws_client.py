@@ -319,7 +319,9 @@ class WeComWSClient:
         if not self._closing:
             logger.warning("WebSocket disconnected, scheduling reconnect")
             self._connected = False
-            await self._reconnect()
+            # Must not await _reconnect() here — it calls _close_ws() which
+            # cancels this task (receive_loop), causing a deadlock.
+            asyncio.create_task(self._reconnect())
 
     async def _handle_frame(self, data: dict[str, Any]) -> None:
         """Route a received frame to the appropriate handler."""
