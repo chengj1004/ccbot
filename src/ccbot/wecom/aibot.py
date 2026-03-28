@@ -226,6 +226,7 @@ class WeComAIBot:
             str, str
         ] = {}  # chatid → "permission"|"planmode"|"question"
         self._pending_writes: dict[str, str] = {}  # tool_use_id → file_path
+        self._sent_files: set[str] = set()  # paths already auto-sent (dedup)
         self._last_status: dict[str, str] = {}  # chatid → last status line (dedup)
 
         # Optional: WeCom client for media downloads and file sending
@@ -1402,6 +1403,16 @@ class WeComAIBot:
         # Append assistant text to stream (skip non-substantive replies)
         if msg.text and msg.text.strip() not in ("No response requested.",):
             await self._update_stream(chatid, f"\n\n{msg.text}")
+
+            # Auto-send document files mentioned in assistant text
+            for fpath in _extract_document_paths(msg.text):
+                if fpath not in self._sent_files:
+                    sent, _err = await self._send_file_via_app(chatid, fpath)
+                    if sent:
+                        self._sent_files.add(fpath)
+                        await self._update_stream(
+                            chatid, f"\n\n📄 File sent: `{Path(fpath).name}`"
+                        )
 
         # Collect images for stream finish
         if msg.image_data:
