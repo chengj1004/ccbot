@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 # Stream update throttle: minimum interval between sends (ms)
 STREAM_THROTTLE_MS = 800
 # Stream auto-finish delay after last content update (seconds)
-STREAM_FINISH_DELAY = 10.0
+STREAM_FINISH_DELAY = 300.0  # 5min safety net; normal finish via terminal completion detection
 # Stream content byte limit (WeCom limit is 20480, leave margin)
 STREAM_MAX_BYTES = 19000
 # Stale stream cleanup interval and TTL
@@ -116,6 +116,11 @@ def _parse_bind_flags(arg: str) -> tuple[dict[str, bool], str]:
         else:
             path_parts.append(part)
     return flags, " ".join(path_parts)
+
+
+def _is_completion_status(status: str) -> bool:
+    """Check if a status line indicates Claude has finished (e.g. 'Churned for 1m 22s')."""
+    return bool(re.search(r"for \d+[hms]", status))
 
 
 def _format_duration(seconds: float) -> str:
@@ -1081,21 +1086,24 @@ class WeComAIBot:
                                 await self._send_interactive_prompt(chatid, ui_content)
                             continue
 
-                    # Status line polling (only when -s flag set)
-                    if not binding.status:
-                        continue
-
+                    # Status line polling
                     stream = self._streams.get(chatid)
-                    if not stream or stream.finished:
+                    status_line = parse_status_line(pane_text)
+
+                    # Detect completion: "Churned for 1m 22s" etc.
+                    if status_line and _is_completion_status(status_line):
+                        if stream and not stream.finished:
+                            await self._do_finish_stream(chatid, completion=status_line)
                         self._last_status.pop(chatid, None)
                         continue
 
-                    status_line = parse_status_line(pane_text)
-                    last = self._last_status.get(chatid)
+                    if not binding.status or not stream or stream.finished:
+                        self._last_status.pop(chatid, None)
+                        continue
 
+                    last = self._last_status.get(chatid)
                     if status_line and status_line != last:
                         self._last_status[chatid] = status_line
-                        # Only show status when stream has no real content yet
                         if self._set_stream_status(chatid, stream, status_line):
                             now = time.time()
                             if (now - stream.last_send_time) * 1000 >= STREAM_THROTTLE_MS:
@@ -1281,8 +1289,14 @@ class WeComAIBot:
         self,
         chatid: str,
         msg_item: list[dict[str, Any]] | None = None,
+        completion: str | None = None,
     ) -> None:
-        """Actually send finish=true for a stream."""
+        """Actually send finish=true for a stream.
+
+        Args:
+            completion: If set, the terminal completion status (e.g. "Churned for 1m 22s").
+                        Used for the Done footer instead of timer-based duration.
+        """
         stream = self._streams.get(chatid)
         if not stream or stream.finished:
             return
@@ -1303,12 +1317,11 @@ class WeComAIBot:
             b64 = base64.b64encode(img_data).decode("ascii")
             items.append({"msgtype": "image", "image": {"base64": b64}})
 
-        # Append completion footer with duration (only if there's real content)
+        # Append completion footer (only if there's real content)
         content = stream.content or ""
-        if stream.has_real_content:
-            elapsed = time.time() - stream.created_at
-            footer = _format_duration(elapsed)
-            content = f"{content}\n\n✅ Done ({footer})"
+        if stream.has_real_content and completion:
+            # Use terminal completion status (e.g. "Churned for 1m 22s")
+            content = f"{content}\n\n✅ {completion}"
 
         await self.ws.send_stream(
             msg_req_id=stream.msg_req_id,
