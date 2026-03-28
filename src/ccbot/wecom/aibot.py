@@ -1099,10 +1099,10 @@ class WeComAIBot:
                     last = self._last_status.get(chatid)
                     if status_line and status_line != last:
                         self._last_status[chatid] = status_line
-                        if self._set_stream_status(chatid, stream, status_line):
-                            now = time.time()
-                            if (now - stream.last_send_time) * 1000 >= STREAM_THROTTLE_MS:
-                                await self._send_stream_update(chatid, stream)
+                        self._set_stream_status(chatid, stream, status_line)
+                        now = time.time()
+                        if (now - stream.last_send_time) * 1000 >= STREAM_THROTTLE_MS:
+                            await self._send_stream_update(chatid, stream)
                     elif not status_line and last:
                         self._last_status.pop(chatid, None)
 
@@ -1113,24 +1113,26 @@ class WeComAIBot:
 
     def _set_stream_status(
         self, chatid: str, stream: ChatStream, status: str
-    ) -> bool:
-        """Replace the ⏳ placeholder with status text.
+    ) -> None:
+        """Set or replace the trailing ⏳ status line in stream content.
 
-        Only works when stream has no real content yet (just ⏳ prefix).
-        Once real content arrives, status updates are ignored to avoid
-        breaking markdown rendering.
-
-        Returns True if status was updated, False if skipped.
+        Always appends/replaces as the last line, regardless of whether
+        real content exists. The status suffix persists until Done or
+        until real content update strips it via _update_stream.
         """
+        suffix = f"\n\n⏳ {status}"
         content = stream.content
-        # Only update if content is still just the placeholder (possibly with old status)
-        base = content.split("\n\n⏳")[0] if "\n\n⏳" in content else content
-        if base.strip() not in ("⏳", ""):
-            return False  # Real content present, skip status update
-
-        stream.content = f"⏳ {status}"
+        # Remove previous status suffix
+        marker = "\n\n⏳ "
+        idx = content.rfind(marker)
+        if idx >= 0:
+            content = content[:idx]
+        # If content is just the initial placeholder, replace it entirely
+        if content.strip() == "⏳" or not content.strip():
+            stream.content = f"⏳ {status}"
+        else:
+            stream.content = content + suffix
         stream._dirty = True
-        return True
 
     async def _send_interactive_prompt(
         self, chatid: str, ui_content: "InteractiveUIContent"
@@ -1208,11 +1210,15 @@ class WeComAIBot:
                 self._reset_finish_timer(chatid)
             return
 
-        # Replace pure status placeholder with real content
-        # Only replace if content is just "⏳" or "⏳ <status>" (no newlines = no real content yet)
+        # Strip trailing status suffix before appending real content
+        marker = "\n\n⏳ "
+        idx = stream.content.rfind(marker)
+        if idx >= 0:
+            stream.content = stream.content[:idx]
+
+        # Replace pure status placeholder, or append
         if stream.content.startswith("⏳") and "\n" not in stream.content:
             stream.content = append_text.lstrip("\n")
-            self._last_status.pop(chatid, None)
         else:
             stream.content += append_text
         stream._dirty = True
