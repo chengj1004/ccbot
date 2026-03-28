@@ -226,7 +226,7 @@ class WeComAIBot:
             str, str
         ] = {}  # chatid → "permission"|"planmode"|"question"
         self._pending_writes: dict[str, str] = {}  # tool_use_id → file_path
-        self._sent_files: set[str] = set()  # paths already auto-sent (dedup)
+        self._sent_files: dict[str, float] = {}  # path → mtime when last sent
         self._last_status: dict[str, str] = {}  # chatid → last status line (dedup)
 
         # Optional: WeCom client for media downloads and file sending
@@ -1301,7 +1301,11 @@ class WeComAIBot:
 
         # Append completion footer with duration (only if there's real content)
         content = stream.content or ""
-        has_real_content = content.replace("⏳", "").strip()
+        # Strip ⏳ prefix and any status text (e.g. "⏳ Tinkering…")
+        check = content
+        if check.startswith("⏳"):
+            check = check.split("\n", 1)[1] if "\n" in check else ""
+        has_real_content = check.strip()
         if has_real_content:
             elapsed = time.time() - stream.created_at
             footer = _format_duration(elapsed)
@@ -1406,13 +1410,18 @@ class WeComAIBot:
 
             # Auto-send document files mentioned in assistant text
             for fpath in _extract_document_paths(msg.text):
-                if fpath not in self._sent_files:
-                    sent, _err = await self._send_file_via_app(chatid, fpath)
-                    if sent:
-                        self._sent_files.add(fpath)
-                        await self._update_stream(
-                            chatid, f"\n\n📄 File sent: `{Path(fpath).name}`"
-                        )
+                try:
+                    mtime = Path(fpath).stat().st_mtime
+                except OSError:
+                    continue
+                if self._sent_files.get(fpath) == mtime:
+                    continue  # Same version already sent
+                sent, _err = await self._send_file_via_app(chatid, fpath)
+                if sent:
+                    self._sent_files[fpath] = mtime
+                    await self._update_stream(
+                        chatid, f"\n\n📄 File sent: `{Path(fpath).name}`"
+                    )
 
         # Collect images for stream finish
         if msg.image_data:
