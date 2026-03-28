@@ -1418,6 +1418,17 @@ class WeComAIBot:
 
         # Append assistant text to stream (skip non-substantive replies)
         if msg.text and msg.text.strip() not in ("No response requested.",):
+            # Clear thinking prefix — real content replaces it
+            stream = self._streams.get(chatid)
+            if stream and not stream.has_real_content:
+                # Strip thinking and status from stream before first real content
+                content = stream.content
+                if "∴ Thinking" in content:
+                    content = ""
+                if content.startswith("⏳"):
+                    content = ""
+                stream.content = content
+
             await self._update_stream(chatid, f"\n\n{msg.text}")
             # Mark stream as having real content (for Done footer)
             stream = self._streams.get(chatid)
