@@ -191,6 +191,7 @@ class ChatStream:
     finish_timer: asyncio.TimerHandle | None = None
     throttle_timer: asyncio.TimerHandle | None = None
     created_at: float = field(default_factory=time.time)
+    has_real_content: bool = False  # True when non-status/non-thinking text added
     _dirty: bool = False  # content updated but not yet sent due to throttle
 
 
@@ -1301,12 +1302,7 @@ class WeComAIBot:
 
         # Append completion footer with duration (only if there's real content)
         content = stream.content or ""
-        # Strip ⏳ prefix and any status text (e.g. "⏳ Tinkering…")
-        check = content
-        if check.startswith("⏳"):
-            check = check.split("\n", 1)[1] if "\n" in check else ""
-        has_real_content = check.strip()
-        if has_real_content:
+        if stream.has_real_content:
             elapsed = time.time() - stream.created_at
             footer = _format_duration(elapsed)
             content = f"{content}\n\n✅ Done ({footer})"
@@ -1407,6 +1403,10 @@ class WeComAIBot:
         # Append assistant text to stream (skip non-substantive replies)
         if msg.text and msg.text.strip() not in ("No response requested.",):
             await self._update_stream(chatid, f"\n\n{msg.text}")
+            # Mark stream as having real content (for Done footer)
+            stream = self._streams.get(chatid)
+            if stream:
+                stream.has_real_content = True
 
             # Auto-send document files mentioned in assistant text
             for fpath in _extract_document_paths(msg.text):
