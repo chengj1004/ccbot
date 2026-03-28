@@ -1203,8 +1203,9 @@ class WeComAIBot:
                 self._pending_content[chatid] += append_text
             return
 
-        # Replace status placeholder with real content
-        if stream.content.startswith("⏳"):
+        # Replace pure status placeholder with real content
+        # Only replace if content is just "⏳" or "⏳ <status>" (no newlines = no real content yet)
+        if stream.content.startswith("⏳") and "\n" not in stream.content:
             stream.content = append_text.lstrip("\n")
             self._last_status.pop(chatid, None)
         else:
