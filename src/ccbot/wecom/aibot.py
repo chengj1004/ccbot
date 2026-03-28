@@ -109,8 +109,6 @@ def _parse_bind_flags(arg: str) -> tuple[dict[str, bool], str]:
             for ch in part[1:]:
                 if ch == "s":
                     flags["status"] = True
-                elif ch == "t":
-                    flags["think"] = True
                 elif ch == "v":
                     flags["verbose"] = True
         else:
@@ -755,8 +753,6 @@ class WeComAIBot:
             await self._cmd_verbose(chatid)
         elif cmd == "/status":
             await self._cmd_toggle(chatid, "status")
-        elif cmd == "/think":
-            await self._cmd_toggle(chatid, "think")
         elif cmd == "/esc":
             await self._cmd_esc(chatid)
         elif cmd == "/screenshot":
@@ -779,11 +775,10 @@ class WeComAIBot:
         if not path_str:
             await self._stream_reply(
                 chatid,
-                "Usage: /bind [-s] [-t] [-v] <path>\n"
-                "  -s  show status line (spinner text)\n"
-                "  -t  show thinking content\n"
-                "  -v  verbose (tool call summaries)\n"
-                "Example: /bind -st /home/user/Code/project",
+                "Usage: /bind [-s] [-v] <path>\n"
+                "  -s  show status + tool calls + Done\n"
+                "  -v  verbose (detailed tool summaries)\n"
+                "Example: /bind -s /home/user/Code/project",
             )
             return
 
@@ -1394,41 +1389,24 @@ class WeComAIBot:
                                 chatid, f"\n\n📄 File written: `{file_path}`"
                             )
 
-            if verbose:
+            # Show tool calls when status or verbose enabled
+            if (binding.status or verbose) and msg.content_type == "tool_use":
                 collector = self._tool_collectors.setdefault(chatid, ToolCollector())
-                if msg.content_type == "tool_use":
-                    collector.add(msg.tool_name or "unknown", msg.text)
+                collector.add(msg.tool_name or "unknown", msg.text)
             return
 
         if msg.content_type == "thinking":
             self._reset_finish_timer(chatid)
-            if binding.think and msg.text:
-                # Show truncated thinking content
-                text = msg.text.strip()
-                if len(text) > 500:
-                    text = text[:500] + "\n… (truncated)"
-                await self._update_stream(chatid, f"\n\n∴ Thinking…\n{text}")
             return
 
         # Text message from assistant — flush tool collector first
-        if verbose and chatid in self._tool_collectors:
+        if (binding.status or verbose) and chatid in self._tool_collectors:
             summary = self._tool_collectors[chatid].flush()
             if summary:
                 await self._update_stream(chatid, f"\n\n{summary}")
 
         # Append assistant text to stream (skip non-substantive replies)
         if msg.text and msg.text.strip() not in ("No response requested.",):
-            # Clear thinking prefix — real content replaces it
-            stream = self._streams.get(chatid)
-            if stream and not stream.has_real_content:
-                # Strip thinking and status from stream before first real content
-                content = stream.content
-                if "∴ Thinking" in content:
-                    content = ""
-                if content.startswith("⏳"):
-                    content = ""
-                stream.content = content
-
             await self._update_stream(chatid, f"\n\n{msg.text}")
             # Mark stream as having real content (for Done footer)
             stream = self._streams.get(chatid)
