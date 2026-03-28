@@ -31,7 +31,11 @@ if TYPE_CHECKING:
 from ..screenshot import text_to_image
 from ..session import session_manager
 from ..session_monitor import NewMessage, SessionMonitor
-from ..terminal_parser import extract_interactive_content, is_interactive_ui
+from ..terminal_parser import (
+    extract_interactive_content,
+    is_interactive_ui,
+    parse_status_line,
+)
 from ..tmux_manager import tmux_manager
 from .config import GroupBinding, WeComConfig
 from .ws_client import WeComWSClient
@@ -90,6 +94,40 @@ def _extract_document_paths(text: str) -> list[str]:
         if _is_document_file(candidate) and Path(candidate).is_file():
             paths.append(candidate)
     return paths
+
+
+def _parse_bind_flags(arg: str) -> tuple[dict[str, bool], str]:
+    """Parse /bind flags like -s -t -v or -stv from the argument string.
+
+    Returns (flags_dict, remaining_path).
+    """
+    parts = arg.split()
+    flags: dict[str, bool] = {}
+    path_parts: list[str] = []
+    for part in parts:
+        if part.startswith("-") and not part.startswith("/") and not path_parts:
+            for ch in part[1:]:
+                if ch == "s":
+                    flags["status"] = True
+                elif ch == "t":
+                    flags["think"] = True
+                elif ch == "v":
+                    flags["verbose"] = True
+        else:
+            path_parts.append(part)
+    return flags, " ".join(path_parts)
+
+
+def _format_duration(seconds: float) -> str:
+    """Format elapsed seconds into a human-readable duration string."""
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m{s}s" if s else f"{m}m"
+    h, m = divmod(m, 60)
+    return f"{h}h{m}m" if m else f"{h}h"
 
 
 def _decrypt_media(encrypted_data: bytes, aeskey_b64: str) -> bytes:
@@ -188,6 +226,7 @@ class WeComAIBot:
             str, str
         ] = {}  # chatid → "permission"|"planmode"|"question"
         self._pending_writes: dict[str, str] = {}  # tool_use_id → file_path
+        self._last_status: dict[str, str] = {}  # chatid → last status line (dedup)
 
         # Optional: WeCom client for media downloads and file sending
         # (requires corp_id + secret; file sending also needs agent_id)
@@ -227,7 +266,7 @@ class WeComAIBot:
         await self.ws.connect()
 
         # Start background tasks
-        asyncio.create_task(self._poll_interactive_ui())
+        asyncio.create_task(self._poll_terminal())
         asyncio.create_task(self._cleanup_stale_streams())
 
     async def shutdown(self) -> None:
@@ -707,6 +746,10 @@ class WeComAIBot:
             await self._cmd_unbind(chatid)
         elif cmd == "/verbose":
             await self._cmd_verbose(chatid)
+        elif cmd == "/status":
+            await self._cmd_toggle(chatid, "status")
+        elif cmd == "/think":
+            await self._cmd_toggle(chatid, "think")
         elif cmd == "/esc":
             await self._cmd_esc(chatid)
         elif cmd == "/screenshot":
@@ -728,11 +771,22 @@ class WeComAIBot:
     async def _cmd_bind(self, chatid: str, path_str: str) -> None:
         if not path_str:
             await self._stream_reply(
-                chatid, "Usage: /bind <path>\nExample: /bind /home/user/Code/project"
+                chatid,
+                "Usage: /bind [-s] [-t] [-v] <path>\n"
+                "  -s  show status line (spinner text)\n"
+                "  -t  show thinking content\n"
+                "  -v  verbose (tool call summaries)\n"
+                "Example: /bind -st /home/user/Code/project",
             )
             return
 
-        path = Path(path_str).expanduser().resolve()
+        # Parse flags and path
+        flags, path_arg = _parse_bind_flags(path_str)
+        if not path_arg:
+            await self._stream_reply(chatid, "Missing path")
+            return
+
+        path = Path(path_arg).expanduser().resolve()
         if not path.is_dir():
             await self._stream_reply(chatid, f"Directory not found: {path}")
             return
@@ -740,7 +794,7 @@ class WeComAIBot:
         sessions = await session_manager.list_sessions_for_directory(str(path))
         if sessions:
             self._pending_session_pick[chatid] = sessions
-            binding = GroupBinding(cwd=str(path), name=path.name)
+            binding = GroupBinding(cwd=str(path), name=path.name, **flags)
             self.wc.groups[chatid] = binding
             self.wc.save_groups()
 
@@ -755,7 +809,7 @@ class WeComAIBot:
             await self._stream_reply(chatid, "\n".join(lines))
             return
 
-        binding = GroupBinding(cwd=str(path), name=path.name)
+        binding = GroupBinding(cwd=str(path), name=path.name, **flags)
         self.wc.groups[chatid] = binding
         self.wc.save_groups()
         await self._stream_reply(chatid, f"Bound to {path}")
@@ -772,14 +826,18 @@ class WeComAIBot:
             await self._stream_reply(chatid, "Not bound")
 
     async def _cmd_verbose(self, chatid: str) -> None:
+        await self._cmd_toggle(chatid, "verbose")
+
+    async def _cmd_toggle(self, chatid: str, field: str) -> None:
         binding = self.wc.groups.get(chatid)
         if not binding:
             await self._stream_reply(chatid, "Not bound")
             return
-        binding.verbose = not binding.verbose
+        current = getattr(binding, field)
+        setattr(binding, field, not current)
         self.wc.save_groups()
-        status = "on" if binding.verbose else "off"
-        await self._stream_reply(chatid, f"Verbose mode {status}")
+        status = "on" if not current else "off"
+        await self._stream_reply(chatid, f"{field} {status}")
 
     async def _cmd_esc(self, chatid: str) -> None:
         binding = self.wc.groups.get(chatid)
@@ -992,31 +1050,77 @@ class WeComAIBot:
             # For questions, forward the actual reply text
             await session_manager.send_to_window(binding.window_id, reply)
 
-    async def _poll_interactive_ui(self) -> None:
-        """Background task to detect interactive UIs in terminal."""
+    async def _poll_terminal(self) -> None:
+        """Background task to detect interactive UIs and poll status lines.
+
+        Runs every 2s. For each bound chat with an active window:
+        1. Check for interactive UI prompts (always)
+        2. Poll status line from terminal and update stream (if -s flag set)
+        """
         while True:
             try:
-                for chatid, binding in self.wc.groups.items():
+                for chatid, binding in list(self.wc.groups.items()):
                     if not binding.window_id:
                         continue
-                    if chatid in self._pending_interactive:
-                        continue  # Already waiting for response
 
                     w = await tmux_manager.find_window_by_id(binding.window_id)
                     if not w:
                         continue
 
                     pane_text = await tmux_manager.capture_pane(w.window_id)
-                    if not pane_text or not is_interactive_ui(pane_text):
+                    if not pane_text:
                         continue
 
-                    ui_content = extract_interactive_content(pane_text)
-                    if ui_content:
-                        await self._send_interactive_prompt(chatid, ui_content)
+                    # Interactive UI detection (skip if already waiting)
+                    if chatid not in self._pending_interactive:
+                        if is_interactive_ui(pane_text):
+                            ui_content = extract_interactive_content(pane_text)
+                            if ui_content:
+                                await self._send_interactive_prompt(chatid, ui_content)
+                            continue
+
+                    # Status line polling (only when -s flag set)
+                    if not binding.status:
+                        continue
+
+                    stream = self._streams.get(chatid)
+                    if not stream or stream.finished:
+                        self._last_status.pop(chatid, None)
+                        continue
+
+                    status_line = parse_status_line(pane_text)
+                    last = self._last_status.get(chatid)
+
+                    if status_line and status_line != last:
+                        self._last_status[chatid] = status_line
+                        # Update stream: replace trailing status line or append
+                        self._set_stream_status(chatid, stream, status_line)
+                        await self._send_stream_update(chatid, stream)
+                    elif not status_line and last:
+                        self._last_status.pop(chatid, None)
+
             except Exception as e:
-                logger.error("Interactive UI poll error: %s", e)
+                logger.error("Terminal poll error: %s", e)
 
             await asyncio.sleep(2.0)
+
+    def _set_stream_status(
+        self, chatid: str, stream: ChatStream, status: str
+    ) -> None:
+        """Set or replace the trailing status line in stream content.
+
+        Status is appended as '\\n\\n⏳ <status>' at the end. If a previous
+        status line exists, it is replaced rather than appended.
+        """
+        prefix = "\n\n⏳ "
+        content = stream.content
+        # Remove previous status suffix
+        idx = content.rfind(prefix)
+        if idx >= 0:
+            content = content[:idx]
+        stream.content = content + prefix + status
+        stream._dirty = True
+        self._reset_finish_timer(chatid)
 
     async def _send_interactive_prompt(
         self, chatid: str, ui_content: "InteractiveUIContent"
@@ -1091,6 +1195,13 @@ class WeComAIBot:
                 self._pending_content.setdefault(chatid, "")
                 self._pending_content[chatid] += append_text
             return
+
+        # Strip trailing status line before appending real content
+        status_prefix = "\n\n⏳ "
+        idx = stream.content.rfind(status_prefix)
+        if idx >= 0:
+            stream.content = stream.content[:idx]
+            self._last_status.pop(chatid, None)
 
         stream.content += append_text
         stream._dirty = True
@@ -1184,10 +1295,18 @@ class WeComAIBot:
             b64 = base64.b64encode(img_data).decode("ascii")
             items.append({"msgtype": "image", "image": {"base64": b64}})
 
+        # Append completion footer with duration (only if there's real content)
+        content = stream.content or ""
+        has_real_content = content.replace("⏳", "").strip()
+        if has_real_content:
+            elapsed = time.time() - stream.created_at
+            footer = _format_duration(elapsed)
+            content = f"{content}\n\n✅ Done ({footer})"
+
         await self.ws.send_stream(
             msg_req_id=stream.msg_req_id,
             stream_id=stream.stream_id,
-            content=stream.content or "✅",
+            content=content,
             finish=True,
             msg_item=items if items else None,
         )
@@ -1263,6 +1382,12 @@ class WeComAIBot:
 
         if msg.content_type == "thinking":
             self._reset_finish_timer(chatid)
+            if binding.think and msg.text:
+                # Show truncated thinking content
+                text = msg.text.strip()
+                if len(text) > 500:
+                    text = text[:500] + "\n… (truncated)"
+                await self._update_stream(chatid, f"\n\n∴ Thinking…\n{text}")
             return
 
         # Text message from assistant — flush tool collector first

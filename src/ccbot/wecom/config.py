@@ -28,6 +28,8 @@ class GroupBinding:
     name: str = ""
     window_id: str = ""  # Filled at runtime when tmux window is created
     verbose: bool = False  # When True, send tool_use/tool_result summaries
+    status: bool = False  # When True, poll terminal status line (spinner text)
+    think: bool = False  # When True, show thinking content in stream
 
 
 class WeComConfig:
@@ -87,6 +89,8 @@ class WeComConfig:
                     name=info.get("name", ""),
                     window_id=info.get("window_id", ""),
                     verbose=info.get("verbose", False),
+                    status=info.get("status", False),
+                    think=info.get("think", False),
                 )
             logger.info("Loaded %d WeCom group bindings", len(self.groups))
         except (json.JSONDecodeError, OSError) as e:
@@ -103,6 +107,10 @@ class WeComConfig:
                 entry["window_id"] = binding.window_id
             if binding.verbose:
                 entry["verbose"] = binding.verbose
+            if binding.status:
+                entry["status"] = binding.status
+            if binding.think:
+                entry["think"] = binding.think
             data[chat_id] = entry
         atomic_write_json(self.groups_file, data)
         logger.debug("Saved %d group bindings", len(data))
