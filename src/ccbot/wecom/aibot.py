@@ -1111,6 +1111,8 @@ class WeComAIBot:
 
         Status is appended as '\\n\\n⏳ <status>' at the end. If a previous
         status line exists, it is replaced rather than appended.
+
+        Does NOT reset the finish timer — only real content should do that.
         """
         prefix = "\n\n⏳ "
         content = stream.content
@@ -1120,7 +1122,6 @@ class WeComAIBot:
             content = content[:idx]
         stream.content = content + prefix + status
         stream._dirty = True
-        self._reset_finish_timer(chatid)
 
     async def _send_interactive_prompt(
         self, chatid: str, ui_content: "InteractiveUIContent"
