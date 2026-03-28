@@ -1201,6 +1201,8 @@ class WeComAIBot:
                 # No msg_req_id — buffer content for when user sends next message
                 self._pending_content.setdefault(chatid, "")
                 self._pending_content[chatid] += append_text
+            else:
+                self._reset_finish_timer(chatid)
             return
 
         # Replace pure status placeholder with real content
