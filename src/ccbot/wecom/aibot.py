@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 # Stream update throttle: minimum interval between sends (ms)
 STREAM_THROTTLE_MS = 800
 # Stream auto-finish delay after last content update (seconds)
-STREAM_FINISH_DELAY = 30.0
+STREAM_FINISH_DELAY = 10.0
 # Stream content byte limit (WeCom limit is 20480, leave margin)
 STREAM_MAX_BYTES = 19000
 # Stale stream cleanup interval and TTL
