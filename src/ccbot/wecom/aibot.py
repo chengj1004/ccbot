@@ -1325,16 +1325,20 @@ class WeComAIBot:
             b64 = base64.b64encode(img_data).decode("ascii")
             items.append({"msgtype": "image", "image": {"base64": b64}})
 
-        # Strip trailing status suffix before finishing
+        # Strip trailing status suffix and ⏳ placeholder before finishing
         content = stream.content or ""
         marker = "\n\n⏳ "
         idx = content.rfind(marker)
         if idx >= 0:
             content = content[:idx]
+        if content.startswith("⏳"):
+            content = ""
 
         # Append completion footer (only if there's real content)
         if stream.has_real_content and completion:
             content = f"{content}\n\n✅ {completion}"
+        elif not content.strip():
+            content = "✅"  # Silent finish for empty/status-only streams
 
         await self.ws.send_stream(
             msg_req_id=stream.msg_req_id,
