@@ -167,7 +167,14 @@ class ToolCollector:
 
     def add(self, tool_name: str, summary: str) -> None:
         if summary:
-            self.tools.append(summary.replace("**", "").replace("*", ""))
+            text = summary.replace("**", "").replace("*", "")
+            # Decode \uXXXX escapes that may appear in Bash commands
+            text = re.sub(
+                r"\\u([0-9a-fA-F]{4})",
+                lambda m: chr(int(m.group(1), 16)),
+                text,
+            )
+            self.tools.append(text)
         else:
             self.tools.append(tool_name)
 
