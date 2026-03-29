@@ -32,7 +32,7 @@ RECONNECT_MAX_DELAY = 60  # seconds
 PENDING_REPLY_TTL = 300  # 5 minutes
 PENDING_REPLY_MAX = 50
 PERIODIC_RECONNECT_INTERVAL = (
-    1800  # 30 min — force re-subscribe to prevent stale routing
+    900  # 15 min — force re-subscribe to prevent stale routing
 )
 
 
