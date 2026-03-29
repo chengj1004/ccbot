@@ -1109,7 +1109,7 @@ class WeComAIBot:
             except Exception as e:
                 logger.error("Terminal poll error: %s", e)
 
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(5.0)
 
     def _set_stream_status(
         self, chatid: str, stream: ChatStream, status: str
