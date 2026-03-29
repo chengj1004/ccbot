@@ -23,6 +23,7 @@ import time
 from telegram import Bot
 from telegram.error import BadRequest
 
+from ..config import config
 from ..session import session_manager
 from ..terminal_parser import is_interactive_ui, parse_status_line
 from ..tmux_manager import tmux_manager
@@ -41,6 +42,14 @@ STATUS_POLL_INTERVAL = 1.0  # seconds - faster response (rate limiting at send l
 
 # Topic existence probe interval
 TOPIC_CHECK_INTERVAL = 60.0  # seconds
+
+# Number of consecutive polls where window must be missing before unbinding.
+# Prevents transient tmux failures (timeouts, race conditions) from dropping
+# bindings prematurely.
+STALE_WINDOW_THRESHOLD = 3
+
+# Track consecutive misses per window_id
+_stale_miss_counts: dict[str, int] = {}
 
 
 async def update_status_message(
@@ -165,11 +174,23 @@ async def status_poll_loop(bot: Bot) -> None:
                             e,
                         )
 
+            seen_wids: set[str] = set()
             for user_id, thread_id, wid in list(session_manager.iter_thread_bindings()):
                 try:
                     # Clean up stale bindings (window no longer exists)
                     w = await tmux_manager.find_window_by_id(wid)
                     if not w:
+                        count = _stale_miss_counts.get(wid, 0) + 1
+                        _stale_miss_counts[wid] = count
+                        if count < STALE_WINDOW_THRESHOLD:
+                            logger.debug(
+                                "Window %s not found (%d/%d), deferring cleanup",
+                                wid,
+                                count,
+                                STALE_WINDOW_THRESHOLD,
+                            )
+                            continue
+                        _stale_miss_counts.pop(wid, None)
                         session_manager.unbind_thread(user_id, thread_id)
                         await clear_topic_state(user_id, thread_id, bot)
                         logger.info(
@@ -178,6 +199,21 @@ async def status_poll_loop(bot: Bot) -> None:
                             thread_id,
                             wid,
                         )
+                        continue
+                    # Window found — reset miss counter
+                    if wid not in seen_wids:
+                        _stale_miss_counts.pop(wid, None)
+                        seen_wids.add(wid)
+
+                    # Auto-respawn dead panes (e.g. SIGHUP from detach)
+                    if await tmux_manager.is_pane_dead(wid):
+                        state = session_manager.get_window_state(wid)
+                        cwd = state.cwd or w.cwd
+                        cmd = config.claude_command
+                        if state.session_id:
+                            cmd = f"{cmd} --resume {state.session_id}"
+                        respawn_cmd = f"cd {cwd} && {cmd}"
+                        await tmux_manager.respawn_pane(wid, respawn_cmd)
                         continue
 
                     # UI detection happens unconditionally in update_status_message.

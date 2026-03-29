@@ -49,6 +49,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction
+from telegram.error import BadRequest
 from telegram.ext import (
     AIORateLimiter,
     Application,
@@ -692,7 +693,20 @@ async def document_handler(update: Update, _context: ContextTypes.DEFAULT_TYPE) 
 
     doc = update.message.document
     original_name = doc.file_name or f"{doc.file_unique_id}"
-    tg_file = await doc.get_file()
+    try:
+        tg_file = await doc.get_file()
+    except BadRequest as exc:
+        if "file is too big" in str(exc).lower():
+            size_mb = (doc.file_size or 0) / 1024 / 1024
+            await safe_reply(
+                update.message,
+                f"❌ File '{original_name}' is too large ({size_mb:.1f} MB). "
+                "Telegram Bot API limit is 20 MB.\n"
+                "Please upload the file directly to the server instead.",
+            )
+        else:
+            await safe_reply(update.message, f"❌ Failed to download file: {exc}")
+        return
 
     filename = f"{int(time.time())}_{original_name}"
     file_path = files_dir / filename
@@ -2016,5 +2030,12 @@ def create_bot() -> Application:
             unsupported_content_handler,
         )
     )
+
+    async def _error_handler(
+        update: object, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        logger.error("Unhandled exception: %s", context.error, exc_info=context.error)
+
+    application.add_error_handler(_error_handler)
 
     return application

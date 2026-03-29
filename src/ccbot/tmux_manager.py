@@ -413,6 +413,8 @@ class TmuxManager:
 
                 # Prevent Claude Code from overriding window name
                 window.set_window_option("allow-rename", "off")
+                # Keep window alive if process exits (prevents binding loss)
+                window.set_window_option("remain-on-exit", "on")
 
                 # Start Claude Code if requested
                 if start_claude:
@@ -441,6 +443,47 @@ class TmuxManager:
                 return False, f"Failed to create window: {e}", "", ""
 
         return await asyncio.to_thread(_create_and_start)
+
+    async def is_pane_dead(self, window_id: str) -> bool:
+        """Check if a window's active pane is dead (process exited)."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "tmux",
+                "list-panes",
+                "-t",
+                f"{self.session_name}:{window_id}",
+                "-F",
+                "#{pane_dead}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            return stdout.decode().strip() == "1"
+        except Exception:
+            return False
+
+    async def respawn_pane(self, window_id: str, command: str) -> bool:
+        """Respawn a dead pane with the given command."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "tmux",
+                "respawn-pane",
+                "-t",
+                f"{self.session_name}:{window_id}",
+                "-k",
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode == 0:
+                logger.info("Respawned dead pane in window %s", window_id)
+                return True
+            logger.error("Failed to respawn pane in %s: %s", window_id, stderr.decode())
+            return False
+        except Exception as e:
+            logger.error("Failed to respawn pane in %s: %s", window_id, e)
+            return False
 
 
 # Global instance with default session name
