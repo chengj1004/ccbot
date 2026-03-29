@@ -621,6 +621,61 @@ class SessionManager:
         if changed:
             self._save_state()
 
+        # Process external bind requests (e.g. from create-topic.sh)
+        await self._process_bind_requests()
+
+    async def _process_bind_requests(self) -> None:
+        """Process pending bind requests from bind_requests.json.
+
+        External tools (e.g. create-topic.sh) write bind requests to this file.
+        Each request contains user_id, thread_id, window_id, display_name, and chat_id.
+        Processed requests are removed from the file.
+        """
+        bind_file = config.config_dir / "bind_requests.json"
+        if not bind_file.exists():
+            return
+        try:
+            async with aiofiles.open(bind_file, "r") as f:
+                content = await f.read()
+            requests = json.loads(content)
+        except (json.JSONDecodeError, OSError):
+            return
+        if not requests:
+            return
+
+        for req in requests:
+            user_id = req.get("user_id")
+            thread_id = req.get("thread_id")
+            window_id = req.get("window_id")
+            display_name = req.get("display_name", "")
+            chat_id = req.get("chat_id")
+
+            if not all([user_id, thread_id, window_id]):
+                continue
+
+            # Skip if already bound
+            existing = self.get_window_for_thread(user_id, thread_id)
+            if existing is not None:
+                continue
+
+            self.bind_thread(user_id, thread_id, window_id, window_name=display_name)
+            if chat_id is not None:
+                self.group_chat_ids[f"{user_id}:{thread_id}"] = int(chat_id)
+                self._save_state()
+            logger.info(
+                "Processed bind request: user=%s thread=%s -> window=%s (%s)",
+                user_id,
+                thread_id,
+                window_id,
+                display_name,
+            )
+
+        # Clear processed requests
+        try:
+            bind_file.unlink()
+        except OSError:
+            pass
+
     # --- Window state management ---
 
     def get_window_state(self, window_id: str) -> WindowState:
