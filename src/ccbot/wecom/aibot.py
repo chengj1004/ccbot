@@ -167,14 +167,7 @@ class ToolCollector:
 
     def add(self, tool_name: str, summary: str) -> None:
         if summary:
-            text = summary.replace("**", "").replace("*", "")
-            # Decode \uXXXX escapes that may appear in Bash commands
-            text = re.sub(
-                r"\\u([0-9a-fA-F]{4})",
-                lambda m: chr(int(m.group(1), 16)),
-                text,
-            )
-            self.tools.append(text)
+            self.tools.append(summary.replace("**", "").replace("*", ""))
         else:
             self.tools.append(tool_name)
 
@@ -1337,8 +1330,10 @@ class WeComAIBot:
         # Append completion footer (only if there's real content)
         if stream.has_real_content and completion:
             content = f"{content}\n\n✅ {completion}"
-        elif not content.strip():
-            content = "✅"  # Silent finish for empty/status-only streams
+
+        # If nothing meaningful to show, just close the stream silently
+        if not content.strip():
+            content = " "  # WeCom requires non-empty content for finish
 
         await self.ws.send_stream(
             msg_req_id=stream.msg_req_id,
