@@ -1331,9 +1331,9 @@ class WeComAIBot:
         if stream.has_real_content and completion:
             content = f"{content}\n\n✅ {completion}"
 
-        # If nothing meaningful to show, just close the stream silently
+        # Skip sending if nothing meaningful to show (e.g. thinking-only streams)
         if not content.strip():
-            content = " "  # WeCom requires non-empty content for finish
+            return
 
         await self.ws.send_stream(
             msg_req_id=stream.msg_req_id,
