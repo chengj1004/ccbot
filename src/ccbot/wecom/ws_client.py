@@ -267,7 +267,9 @@ class WeComWSClient:
                     logger.warning(
                         "Missed %d pongs, triggering reconnect", self._missed_pongs
                     )
-                    await self._reconnect()
+                    # Must not await _reconnect() here — it calls _close_ws() which
+                    # cancels this task (ping_loop), causing a deadlock.
+                    asyncio.create_task(self._reconnect())
                     return
 
                 # Send ping
