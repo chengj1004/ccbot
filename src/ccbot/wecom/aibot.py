@@ -53,27 +53,21 @@ STREAM_CLEANUP_INTERVAL = 60  # seconds
 STREAM_TTL = 600  # 10 minutes
 
 # File extensions for document auto-mention in stream
-_DOCUMENT_EXTENSIONS = {
-    ".docx",
-    ".doc",
-    ".pdf",
-    ".xlsx",
-    ".xls",
-    ".csv",
-    ".pptx",
-    ".ppt",
-    ".zip",
-    ".tar",
-    ".gz",
-    ".7z",
-    ".html",
-    ".htm",
-    ".md",
-    ".txt",
-    ".json",
-    ".yaml",
-    ".yml",
+# File types that can be sent via /file command
+_SENDABLE_EXTENSIONS = {
+    ".docx", ".doc", ".pdf", ".xlsx", ".xls", ".csv", ".pptx", ".ppt",
+    ".zip", ".tar", ".gz", ".7z", ".html", ".htm",
+    ".md", ".txt", ".json", ".yaml", ".yml",
+    ".png", ".jpg", ".jpeg",
 }
+
+# Patterns indicating Claude has finished producing a file
+_DELIVERY_PATTERNS = re.compile(
+    r"已生成|已创建|已保存|已导出|已更新|已写入|生成了|创建了|保存到|导出到|写入到"
+    r"|generated|created|saved|exported|written|produced|here is|here's the"
+    r"|文件在|file is at|output",
+    re.IGNORECASE,
+)
 
 
 def _extract_file_path(tool_text: str) -> str:
@@ -83,11 +77,18 @@ def _extract_file_path(tool_text: str) -> str:
 
 
 def _is_document_file(path: str) -> bool:
-    return Path(path).suffix.lower() in _DOCUMENT_EXTENSIONS
+    """Check if file is sendable (for /file command)."""
+    return Path(path).suffix.lower() in _SENDABLE_EXTENSIONS
 
 
-def _extract_document_paths(text: str) -> list[str]:
-    """Extract absolute file paths with document extensions from assistant text."""
+def _extract_deliverable_paths(text: str) -> list[str]:
+    """Extract file paths from text that indicates delivery (已生成/created/etc).
+
+    Only scans text containing delivery keywords, so intermediate mentions
+    like "updating config.json" or "reading CLAUDE.md" won't trigger auto-send.
+    """
+    if not _DELIVERY_PATTERNS.search(text):
+        return []
     paths: list[str] = []
     for match in re.finditer(r"(/[^\s`\"'<>]+)", text):
         candidate = match.group(1).rstrip(".,;:)。，；：）")
@@ -1431,7 +1432,7 @@ class WeComAIBot:
                 stream.has_real_content = True
 
             # Auto-send document files mentioned in assistant text
-            for fpath in _extract_document_paths(msg.text):
+            for fpath in _extract_deliverable_paths(msg.text):
                 try:
                     mtime = Path(fpath).stat().st_mtime
                 except OSError:
