@@ -92,6 +92,7 @@ class TmuxManager:
             except Exception:
                 pass  # var not set in session env — nothing to remove
 
+
     async def list_windows(self) -> list[TmuxWindow]:
         """List all windows in the session with their working directories.
 

@@ -19,7 +19,14 @@ from .utils import ccbot_dir
 logger = logging.getLogger(__name__)
 
 # Env vars that must not leak to child processes (e.g. Claude Code via tmux)
-SENSITIVE_ENV_VARS = {"TELEGRAM_BOT_TOKEN", "ALLOWED_USERS", "OPENAI_API_KEY"}
+SENSITIVE_ENV_VARS = {
+    "TELEGRAM_BOT_TOKEN",
+    "ALLOWED_USERS",
+    "OPENAI_API_KEY",
+    "WECOM_SECRET",
+    "WECOM_CALLBACK_TOKEN",
+    "WECOM_ENCODING_AES_KEY",
+}
 
 
 class Config:
@@ -41,21 +48,21 @@ class Config:
             logger.debug("Loaded env from %s", global_env)
 
         self.telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN") or ""
-        if not self.telegram_bot_token:
-            raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
 
         allowed_users_str = os.getenv("ALLOWED_USERS", "")
-        if not allowed_users_str:
-            raise ValueError("ALLOWED_USERS environment variable is required")
-        try:
-            self.allowed_users: set[int] = {
-                int(uid.strip()) for uid in allowed_users_str.split(",") if uid.strip()
-            }
-        except ValueError as e:
-            raise ValueError(
-                f"ALLOWED_USERS contains non-numeric value: {e}. "
-                "Expected comma-separated Telegram user IDs."
-            ) from e
+        self.allowed_users: set[int] = set()
+        if allowed_users_str:
+            try:
+                self.allowed_users = {
+                    int(uid.strip())
+                    for uid in allowed_users_str.split(",")
+                    if uid.strip()
+                }
+            except ValueError as e:
+                raise ValueError(
+                    f"ALLOWED_USERS contains non-numeric value: {e}. "
+                    "Expected comma-separated Telegram user IDs."
+                ) from e
 
         # Tmux session name and window naming
         self.tmux_session_name = os.getenv("TMUX_SESSION_NAME", "ccbot")
@@ -127,6 +134,13 @@ class Config:
             self.tmux_session_name,
             self.claude_projects_path,
         )
+
+    def validate_telegram(self) -> None:
+        """Validate Telegram-specific config. Called from Telegram bot entry point."""
+        if not self.telegram_bot_token:
+            raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
+        if not self.allowed_users:
+            raise ValueError("ALLOWED_USERS environment variable is required")
 
     def is_user_allowed(self, user_id: int) -> bool:
         """Check if a user is in the allowed list."""
