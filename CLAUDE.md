@@ -36,6 +36,30 @@ ccbot hook --install                  # Auto-install Claude Code SessionStart ho
 - `.env` loading priority: local `.env` > config dir `.env`.
 - State files: `state.json` (thread bindings), `session_map.json` (hook-generated), `monitor_state.json` (byte offsets), `bind_requests.json` (external bind requests, transient).
 
+## Crash Recovery (tmux server lost)
+
+When the tmux server dies, every window is gone but `state.json` still holds the
+bindings. Recovery is: recreate the windows by display name, then remap the
+persisted window IDs. Two traps make this easy to get wrong:
+
+- **`session_map.json` is a second source of truth.** It is keyed by window ID
+  too. Remapping only `state.json` does not stick — on startup the bot rebuilds
+  `window_states` / `window_display_names` from `session_map.json` and silently
+  reverts to the pre-crash mapping. Remap both files together, or the bot will
+  wake a session in the wrong window.
+- **`resolve_stale_ids()` cannot detect this.** It treats a window ID as valid
+  when the ID exists in live tmux. Fresh IDs reuse the same low numbers, so old
+  and new ranges overlap and stale entries look live.
+
+Rebuild both files from a pre-crash backup keyed by **window name** (the only
+stable identifier across a tmux restart), not by ID. Stop the bot first — it
+rewrites state on its own.
+
+Recreate windows with `remain-on-exit on`, then SIGHUP the pane process so the
+pane is dead: `wake_up` only respawns claude when `pane_dead=1`. A window left
+with a live shell makes `wake_up` believe claude is already running and send
+keystrokes into bash.
+
 ## Hook Configuration
 
 Auto-install: `ccbot hook --install`
