@@ -48,8 +48,16 @@ TOPIC_CHECK_INTERVAL = 60.0  # seconds
 # bindings prematurely.
 STALE_WINDOW_THRESHOLD = 3
 
+# Number of consecutive Topic_id_invalid probes required before declaring a
+# topic deleted. With TOPIC_CHECK_INTERVAL=60s, a value of 2 means 60-120s
+# of confirmation before killing.
+TOPIC_DELETED_CONFIRMATION_MISSES = 2
+
 # Track consecutive misses per window_id
 _stale_miss_counts: dict[str, int] = {}
+
+# Track consecutive Topic_id_invalid misses per thread_id
+_topic_probe_miss_counts: dict[int, int] = {}
 
 
 async def update_status_message(
@@ -141,14 +149,48 @@ async def status_poll_loop(bot: Bot) -> None:
                 for user_id, thread_id, wid in list(
                     session_manager.iter_thread_bindings()
                 ):
+                    # Defensive: skip probe if we don't have a real chat_id
+                    # mapping. resolve_chat_id falls back to user_id when no
+                    # mapping exists; probing with that bogus chat_id would
+                    # return "Chat not found" and falsely trigger deletion.
+                    resolved_chat_id = session_manager.resolve_chat_id(
+                        user_id, thread_id
+                    )
+                    if resolved_chat_id == user_id:
+                        logger.debug(
+                            "Skip topic probe for thread %d (no chat_id mapping yet)",
+                            thread_id,
+                        )
+                        continue
                     try:
                         await bot.unpin_all_forum_topic_messages(
-                            chat_id=session_manager.resolve_chat_id(user_id, thread_id),
+                            chat_id=resolved_chat_id,
                             message_thread_id=thread_id,
                         )
+                        # Successful probe — reset miss counter
+                        _topic_probe_miss_counts.pop(thread_id, None)
                     except BadRequest as e:
-                        if "Topic_id_invalid" in str(e):
-                            # Topic deleted — kill window, unbind, and clean up state
+                        msg = str(e)
+                        # Only Topic_id_invalid is a reliable signal of
+                        # deletion. "Message thread not found" and "Chat not
+                        # found" can be triggered by transient state issues
+                        # (e.g. bind not fully propagated, bot restart) and
+                        # were causing false-positive kills of freshly bound
+                        # windows. Require N consecutive failures before kill.
+                        if "Topic_id_invalid" in msg:
+                            miss = _topic_probe_miss_counts.get(thread_id, 0) + 1
+                            _topic_probe_miss_counts[thread_id] = miss
+                            if miss < TOPIC_DELETED_CONFIRMATION_MISSES:
+                                logger.info(
+                                    "Topic probe failed for thread %d (%d/%d): %s",
+                                    thread_id,
+                                    miss,
+                                    TOPIC_DELETED_CONFIRMATION_MISSES,
+                                    e,
+                                )
+                                continue
+                            _topic_probe_miss_counts.pop(thread_id, None)
+                            # Topic confirmed deleted — kill window, unbind
                             w = await tmux_manager.find_window_by_id(wid)
                             if w:
                                 await tmux_manager.kill_window(w.window_id)
@@ -205,11 +247,16 @@ async def status_poll_loop(bot: Bot) -> None:
                         _stale_miss_counts.pop(wid, None)
                         seen_wids.add(wid)
 
-                    # Auto-respawn dead panes (e.g. SIGHUP from detach)
+                    # Auto-respawn dead panes (e.g. SIGHUP from detach).
+                    # Skip if the window was intentionally hibernated — we
+                    # only respawn on real inbound activity (send_to_window).
                     if await tmux_manager.is_pane_dead(wid):
                         state = session_manager.get_window_state(wid)
+                        if state and state.hibernated:
+                            continue
                         cwd = state.cwd or w.cwd
-                        cmd = config.claude_command
+                        # Unattended auto-respawn — skip permission prompts.
+                        cmd = f"{config.claude_command} --dangerously-skip-permissions"
                         if state.session_id:
                             cmd = f"{cmd} --resume {state.session_id}"
                         respawn_cmd = f"cd {cwd} && {cmd}"
@@ -219,7 +266,7 @@ async def status_poll_loop(bot: Bot) -> None:
                     # UI detection happens unconditionally in update_status_message.
                     # Status enqueue is skipped inside update_status_message when
                     # interactive UI is detected (returns early) or when queue is non-empty.
-                    queue = get_message_queue(user_id)
+                    queue = get_message_queue(user_id, wid)
                     skip_status = queue is not None and not queue.empty()
 
                     await update_status_message(

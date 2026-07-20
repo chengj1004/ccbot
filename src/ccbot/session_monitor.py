@@ -333,6 +333,11 @@ class SessionMonitor:
                         f"Read {len(new_entries)} new entries for "
                         f"session {session_info.session_id}"
                     )
+                    # Mark the owning window as active so hibernation_loop
+                    # doesn't stop a session that's still emitting output.
+                    from .session import session_manager
+
+                    session_manager.bump_activity_by_session(session_info.session_id)
 
                 # Parse new entries using the shared logic, carrying over pending tools
                 carry = self._pending_tools.get(session_info.session_id, {})

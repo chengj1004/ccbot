@@ -29,6 +29,7 @@ from .callback_data import (
     CB_ASK_REFRESH,
     CB_ASK_RIGHT,
     CB_ASK_SPACE,
+    CB_ASK_SUBMIT,
     CB_ASK_TAB,
     CB_ASK_UP,
 )
@@ -137,6 +138,19 @@ def _build_interactive_keyboard(
             ),
         ]
     )
+    # Row 3: explicit Submit for AskUserQuestion (Tab→Submit→Enter).
+    # In multi-select prompts, Enter on a choice toggles instead of submitting,
+    # so Telegram users get stuck. This button always commits the current
+    # selection.
+    if ui_name == "AskUserQuestion":
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "✅ Submit",
+                    callback_data=f"{CB_ASK_SUBMIT}{window_id}"[:64],
+                ),
+            ]
+        )
     return InlineKeyboardMarkup(rows)
 
 
@@ -156,6 +170,17 @@ async def handle_interactive_ui(
     chat_id = session_manager.resolve_chat_id(user_id, thread_id)
     w = await tmux_manager.find_window_by_id(window_id)
     if not w:
+        return False
+
+    # Dead pane can't receive keystrokes — re-sending the card just shows the
+    # last-frame snapshot, so users see "↓ does nothing". Drop the stale card
+    # and let the next send_to_window respawn via wake_up.
+    if await tmux_manager.is_pane_dead(w.window_id):
+        logger.debug(
+            "Pane is dead for window_id %s, dropping stale interactive UI",
+            window_id,
+        )
+        await clear_interactive_msg(user_id, bot, thread_id)
         return False
 
     # Capture plain text (no ANSI colors)

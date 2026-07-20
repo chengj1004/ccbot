@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Iterator
@@ -44,15 +45,15 @@ logger = logging.getLogger(__name__)
 class WindowState:
     """Persistent state for a tmux window.
 
-    Attributes:
-        session_id: Associated Claude session ID (empty if not yet detected)
-        cwd: Working directory for direct file path construction
-        window_name: Display name of the window
+    hibernated=True means claude was intentionally stopped to free memory;
+    status_polling skips auto-respawn while it's set, and send_to_window
+    respawns claude --resume on the next inbound message.
     """
 
     session_id: str = ""
     cwd: str = ""
     window_name: str = ""
+    hibernated: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -61,6 +62,8 @@ class WindowState:
         }
         if self.window_name:
             d["window_name"] = self.window_name
+        if self.hibernated:
+            d["hibernated"] = True
         return d
 
     @classmethod
@@ -69,6 +72,7 @@ class WindowState:
             session_id=data.get("session_id", ""),
             cwd=data.get("cwd", ""),
             window_name=data.get("window_name", ""),
+            hibernated=bool(data.get("hibernated", False)),
         )
 
 
@@ -115,6 +119,110 @@ class SessionManager:
 
     def __post_init__(self) -> None:
         self._load_state()
+        # Per-window wall-clock timestamp (time.time()) of last activity.
+        # In-memory only — reset on bot restart. Activity = user message sent
+        # to claude OR new JSONL entry from claude. Used by hibernation_loop
+        # to decide when to stop idle claude sessions, and by /idle to show
+        # the user when each topic was last active.
+        self._last_activity_at: dict[str, float] = {}
+        # Per-window async lock to serialize wake_up calls so two concurrent
+        # inbound messages can't both respawn the same pane.
+        self._wake_locks: dict[str, asyncio.Lock] = {}
+
+    def bump_activity(self, window_id: str) -> None:
+        """Mark this window as active right now (wall-clock)."""
+        self._last_activity_at[window_id] = time.time()
+
+    def bump_activity_by_session(self, session_id: str) -> None:
+        """Mark the window holding this session as active. No-op if unknown."""
+        for wid, ws in self.window_states.items():
+            if ws.session_id == session_id:
+                self.bump_activity(wid)
+                return
+
+    def get_last_activity(self, window_id: str) -> float | None:
+        return self._last_activity_at.get(window_id)
+
+    async def wake_up(self, window_id: str) -> bool:
+        """Respawn claude in a hibernated/dead pane and wait until ready.
+
+        Idempotent: if the pane already has claude running, just clears the
+        hibernated flag and returns True. Serialized per window so concurrent
+        callers don't both respawn.
+        """
+        ws = self.window_states.get(window_id)
+        if not ws:
+            logger.warning("wake_up: no window_state for %s", window_id)
+            return False
+
+        lock = self._wake_locks.setdefault(window_id, asyncio.Lock())
+        async with lock:
+            # Re-read under lock in case another waiter already woke us
+            ws = self.window_states.get(window_id)
+            if not ws:
+                return False
+
+            # If pane is alive, nothing to respawn — claude is already running.
+            if not await tmux_manager.is_pane_dead(window_id):
+                if ws.hibernated:
+                    ws.hibernated = False
+                    self._save_state()
+                self.bump_activity(window_id)
+                return True
+
+            cwd = ws.cwd
+            sid = ws.session_id
+            # --dangerously-skip-permissions: no human present to approve
+            # the resumed session's permission prompts.
+            cmd = f"{config.claude_command} --dangerously-skip-permissions"
+            if sid:
+                cmd = f"{cmd} --resume {sid}"
+            respawn_cmd = f"cd {cwd} && {cmd}" if cwd else cmd
+
+            sm_file = config.session_map_file
+            try:
+                before_mtime = sm_file.stat().st_mtime
+            except OSError:
+                before_mtime = 0.0
+
+            logger.info(
+                "Waking window %s (%s), session=%s",
+                window_id,
+                ws.window_name,
+                sid[:8] if sid else "<none>",
+            )
+
+            ok = await tmux_manager.respawn_pane(window_id, respawn_cmd)
+            if not ok:
+                logger.error("wake_up: respawn_pane failed for %s", window_id)
+                return False
+
+            # Wait up to 15s for SessionStart hook to fire (signals claude is up).
+            deadline = time.monotonic() + 15.0
+            hook_fired = False
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.5)
+                try:
+                    cur = sm_file.stat().st_mtime
+                except OSError:
+                    continue
+                if cur > before_mtime:
+                    hook_fired = True
+                    break
+
+            if hook_fired:
+                # Give claude a moment to render the prompt after the hook.
+                await asyncio.sleep(1.5)
+            else:
+                logger.warning(
+                    "wake_up: hook didn't fire within 15s for %s; sending keys anyway",
+                    window_id,
+                )
+
+            ws.hibernated = False
+            self._save_state()
+            self.bump_activity(window_id)
+            return True
 
     def _save_state(self) -> None:
         state: dict[str, Any] = {
@@ -612,7 +720,13 @@ class SessionManager:
                     changed = True
 
         # Clean up window_states entries not in current session_map.
-        stale_wids = [w for w in self.window_states if w and w not in valid_wids]
+        # Hibernated entries have no live claude → no session_map row by
+        # design; skip them so wake_up can still find their cwd/session_id.
+        stale_wids = [
+            w
+            for w, st in self.window_states.items()
+            if w and w not in valid_wids and not st.hibernated
+        ]
         for wid in stale_wids:
             logger.info("Removing stale window_state: %s", wid)
             del self.window_states[wid]
@@ -660,8 +774,7 @@ class SessionManager:
 
             self.bind_thread(user_id, thread_id, window_id, window_name=display_name)
             if chat_id is not None:
-                self.group_chat_ids[f"{user_id}:{thread_id}"] = int(chat_id)
-                self._save_state()
+                self.set_group_chat_id(int(user_id), int(thread_id), int(chat_id))
             logger.info(
                 "Processed bind request: user=%s thread=%s -> window=%s (%s)",
                 user_id,
@@ -968,7 +1081,11 @@ class SessionManager:
     # --- Tmux helpers ---
 
     async def send_to_window(self, window_id: str, text: str) -> tuple[bool, str]:
-        """Send text to a tmux window by ID."""
+        """Send text to a tmux window by ID.
+
+        If the window is marked hibernated (or its pane is dead), respawns
+        claude via wake_up first, then sends keys. Bumps activity on success.
+        """
         display = self.get_display_name(window_id)
         logger.debug(
             "send_to_window: window_id=%s (%s), text_len=%d",
@@ -979,8 +1096,22 @@ class SessionManager:
         window = await tmux_manager.find_window_by_id(window_id)
         if not window:
             return False, "Window not found (may have been closed)"
+
+        # Wake hibernated panes before sending. Also defensively wake if the
+        # pane is dead for any other reason (e.g. claude crashed before
+        # status_polling noticed).
+        ws = self.window_states.get(window_id)
+        needs_wake = (ws is not None and ws.hibernated) or (
+            await tmux_manager.is_pane_dead(window_id)
+        )
+        if needs_wake:
+            woken = await self.wake_up(window_id)
+            if not woken:
+                return False, "Failed to wake hibernated session"
+
         success = await tmux_manager.send_keys(window.window_id, text)
         if success:
+            self.bump_activity(window_id)
             return True, f"Sent to {display}"
         return False, "Failed to send keys"
 

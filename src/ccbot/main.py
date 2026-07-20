@@ -10,12 +10,45 @@ import logging
 import sys
 
 
+_USAGE = """Usage: ccbot [SUBCOMMAND]
+
+  (no args)   Start the Telegram bot polling loop (singleton per host).
+  hook        Process Claude Code SessionStart hook stdin.
+  send        Enqueue a message for delivery to a Telegram thread.
+  ask         Submit an AskUserQuestion to a thread and wait for an answer.
+
+Refuses to start the bot when given -h/--help or any unknown flag — probe
+commands like `ccbot --help` used to silently spawn a second updater and
+duplicate every Telegram reply.
+"""
+
+
 def main() -> None:
     """Main entry point."""
+    # Reject probe-style invocations before they spawn a second bot updater.
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+        print(_USAGE)
+        return
+    if len(sys.argv) > 1 and sys.argv[1].startswith("-"):
+        print(f"ccbot: unknown option {sys.argv[1]!r}\n\n{_USAGE}", file=sys.stderr)
+        sys.exit(2)
+
     if len(sys.argv) > 1 and sys.argv[1] == "hook":
         from .hook import hook_main
 
         hook_main()
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "send":
+        from .send_request import send_main
+
+        send_main(sys.argv[2:])
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "ask":
+        from .ask_cli import ask_main
+
+        ask_main(sys.argv[2:])
         return
 
     logging.basicConfig(

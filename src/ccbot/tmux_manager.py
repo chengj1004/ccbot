@@ -422,7 +422,13 @@ class TmuxManager:
                     if pane:
                         cmd = config.claude_command
                         if resume_session_id:
-                            cmd = f"{cmd} --resume {resume_session_id}"
+                            # --dangerously-skip-permissions: resumed sessions
+                            # may carry pending permission prompts; bot can't
+                            # answer them, so skip to keep claude unblocked.
+                            cmd = (
+                                f"{cmd} --dangerously-skip-permissions "
+                                f"--resume {resume_session_id}"
+                            )
                         pane.send_keys(cmd, enter=True)
 
                 logger.info(
@@ -460,6 +466,48 @@ class TmuxManager:
             stdout, _ = await proc.communicate()
             return stdout.decode().strip() == "1"
         except Exception:
+            return False
+
+    async def kill_pane_process(self, window_id: str) -> bool:
+        """Kill the pane's primary process (typically bash) with SIGHUP.
+
+        Used for hibernation. With `remain-on-exit on` (set at window creation),
+        the pane becomes dead but the window survives — preserving its
+        window_id and thread binding.
+
+        SIGHUP is chosen because interactive bash ignores SIGTERM but exits
+        on SIGHUP (terminal hangup semantics), and bash propagates SIGHUP to
+        foreground children — claude receives it and exits.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "tmux",
+                "list-panes",
+                "-t",
+                f"{self.session_name}:{window_id}",
+                "-F",
+                "#{pane_pid}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            pid_str = stdout.decode().strip()
+            if not pid_str:
+                return False
+            pid = int(pid_str)
+        except (ValueError, Exception) as e:
+            logger.error("kill_pane_process: lookup failed for %s: %s", window_id, e)
+            return False
+
+        import os as _os
+        import signal as _signal
+
+        try:
+            _os.kill(pid, _signal.SIGHUP)
+            logger.info("Sent SIGHUP to pane %s (pid=%d)", window_id, pid)
+            return True
+        except (ProcessLookupError, PermissionError) as e:
+            logger.error("kill_pane_process: kill failed for %s: %s", window_id, e)
             return False
 
     async def respawn_pane(self, window_id: str, command: str) -> bool:

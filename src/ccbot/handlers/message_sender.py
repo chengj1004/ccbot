@@ -80,7 +80,10 @@ async def send_with_fallback(
         except RetryAfter:
             raise
         except Exception as e:
-            logger.error(f"Failed to send message to {chat_id}: {e}")
+            logger.error(
+                f"Failed to send message to {chat_id} "
+                f"thread={kwargs.get('message_thread_id')}: {e}"
+            )
             return None
 
 
@@ -195,4 +198,7 @@ async def safe_send(
         except RetryAfter:
             raise
         except Exception as e:
-            logger.error(f"Failed to send message to {chat_id}: {e}")
+            logger.error(
+                f"Failed to send message to {chat_id} "
+                f"thread={kwargs.get('message_thread_id')}: {e}"
+            )

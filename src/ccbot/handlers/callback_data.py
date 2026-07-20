@@ -41,6 +41,7 @@ CB_ASK_ENTER = "aq:enter:"  # aq:enter:<window>
 CB_ASK_SPACE = "aq:spc:"  # aq:spc:<window>
 CB_ASK_TAB = "aq:tab:"  # aq:tab:<window>
 CB_ASK_REFRESH = "aq:ref:"  # aq:ref:<window>
+CB_ASK_SUBMIT = "aq:sub:"  # aq:sub:<window> — sends Tab+Enter to submit multi-select
 
 # Session picker (resume existing session)
 CB_SESSION_SELECT = "rs:sel:"  # rs:sel:<index>

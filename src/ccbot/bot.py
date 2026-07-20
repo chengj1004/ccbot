@@ -4,8 +4,8 @@ Registers all command/callback/message handlers and manages the bot lifecycle.
 Each Telegram topic maps 1:1 to a tmux window (Claude session).
 
 Core responsibilities:
-  - Command handlers: /start, /history, /screenshot, /esc, /kill, /unbind,
-    plus forwarding unknown /commands to Claude Code via tmux.
+  - Command handlers: /start, /history, /screenshot, /esc, /file, /kill,
+    /unbind, plus forwarding unknown /commands to Claude Code via tmux.
   - Callback query handler: directory browser, history pagination,
     interactive UI navigation, screenshot refresh.
   - Topic-based routing: each named topic binds to one tmux window.
@@ -69,6 +69,7 @@ from .handlers.callback_data import (
     CB_ASK_REFRESH,
     CB_ASK_RIGHT,
     CB_ASK_SPACE,
+    CB_ASK_SUBMIT,
     CB_ASK_TAB,
     CB_ASK_UP,
     CB_DIR_CANCEL,
@@ -131,6 +132,9 @@ from .handlers.message_sender import (
 )
 from .markdown_v2 import convert_markdown
 from .handlers.response_builder import build_response_parts
+from .handlers.ask_request import ask_request_loop
+from .handlers.file_send_polling import file_send_request_loop
+from .handlers.hibernation import hibernation_loop
 from .handlers.status_polling import status_poll_loop
 from .screenshot import text_to_image
 from .session import session_manager
@@ -148,6 +152,15 @@ session_monitor: SessionMonitor | None = None
 
 # Status polling task
 _status_poll_task: asyncio.Task | None = None
+
+# File send polling task (reads ~/.ccbot/file_send_requests/)
+_file_send_task: asyncio.Task | None = None
+
+# Hibernation task (stops idle claude sessions to free memory)
+_hibernation_task: asyncio.Task | None = None
+
+# Ask-request task (reads ~/.ccbot/ask_requests/, sends prompts, writes responses)
+_ask_request_task: asyncio.Task | None = None
 
 # Claude Code commands shown in bot menu (forwarded via tmux)
 CC_COMMANDS: dict[str, str] = {
@@ -280,6 +293,63 @@ async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+async def file_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a file from the session's working directory to Telegram.
+
+    Usage: /file <path>
+    Relative paths resolve against the bound window's cwd; absolute paths
+    (and ~) are used as-is.
+    """
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
+    if not wid:
+        await safe_reply(update.message, "❌ No session bound to this topic.")
+        return
+
+    args = context.args or []
+    if not args:
+        await safe_reply(
+            update.message,
+            "Usage: `/file <path>`\nRelative paths resolve against the session cwd.",
+        )
+        return
+
+    raw_path = " ".join(args).strip().strip("'\"")
+    state = session_manager.get_window_state(wid)
+    base = Path(state.cwd) if state.cwd else Path.cwd()
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = (base / path).resolve()
+
+    if not path.exists():
+        await safe_reply(update.message, f"❌ File not found: `{path}`")
+        return
+    if not path.is_file():
+        await safe_reply(update.message, f"❌ Not a regular file: `{path}`")
+        return
+
+    size = path.stat().st_size
+    if size > 50 * 1024 * 1024:
+        await safe_reply(
+            update.message,
+            f"❌ File too large ({size / 1024 / 1024:.1f} MB). "
+            "Telegram bot upload limit is 50 MB.",
+        )
+        return
+
+    try:
+        with path.open("rb") as f:
+            await update.message.reply_document(document=f, filename=path.name)
+    except Exception as e:
+        await safe_reply(update.message, f"❌ Failed to send file: {e}")
+
+
 async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send Escape key to interrupt Claude."""
     user = update.effective_user
@@ -303,6 +373,75 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Send Escape control character (no enter)
     await tmux_manager.send_keys(w.window_id, "\x1b", enter=False)
     await safe_reply(update.message, "⎋ Sent Escape")
+
+
+async def idle_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List bound topics with their last-activity time and idle duration."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id) or not update.message:
+        return
+
+    import time as _time
+
+    now = _time.time()
+
+    # Collect rows: (idle_sec, display, wid, last_at, state_icon)
+    # state_icon: 💤 hibernated, 💀 dead-but-not-hibernated (anomaly), 🟢 running
+    rows: list[tuple[float, str, str, float | None, str]] = []
+    seen: set[str] = set()
+    for _uid, _tid, wid in session_manager.iter_thread_bindings():
+        if wid in seen:
+            continue
+        seen.add(wid)
+        display = session_manager.get_display_name(wid)
+        last = session_manager.get_last_activity(wid)
+        ws = session_manager.get_window_state(wid)
+        hibernated = bool(ws and ws.hibernated)
+        if hibernated:
+            icon = "💤"
+        elif await tmux_manager.is_pane_dead(wid):
+            icon = "💀"
+        else:
+            icon = "🟢"
+        idle = (now - last) if last is not None else float("inf")
+        rows.append((idle, display, wid, last, icon))
+
+    if not rows:
+        await safe_reply(update.message, "No bound topics.")
+        return
+
+    rows.sort(reverse=True)  # most idle first
+
+    def fmt_idle(sec: float) -> str:
+        if sec == float("inf"):
+            return "—"
+        if sec < 60:
+            return f"{int(sec)}s"
+        if sec < 3600:
+            return f"{int(sec / 60)}m"
+        if sec < 86400:
+            h, m = divmod(int(sec / 60), 60)
+            return f"{h}h{m}m"
+        d, h = divmod(int(sec / 3600), 24)
+        return f"{d}d{h}h"
+
+    def fmt_at(ts: float | None) -> str:
+        if ts is None:
+            return "—"
+        from datetime import datetime
+
+        return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
+
+    name_w = max(len(r[1]) for r in rows)
+    lines = ["```"]
+    lines.append(f"{'window':<5}  {'name':<{name_w}}  {'last':<11}  {'idle':>6}  state")
+    for idle, display, wid, last, icon in rows:
+        lines.append(
+            f"{wid:<5}  {display:<{name_w}}  {fmt_at(last):<11}  "
+            f"{fmt_idle(idle):>6}  {icon}"
+        )
+    lines.append("```")
+    await safe_reply(update.message, "\n".join(lines))
 
 
 async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -783,6 +922,21 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     voice_file = await update.message.voice.get_file()
     ogg_data = bytes(await voice_file.download_as_bytearray())
 
+    # Also persist the audio to the project's .files/ so the session can run
+    # acoustic / pronunciation analysis on the original recording (not just text).
+    audio_path = None
+    try:
+        state = session_manager.get_window_state(wid)
+        files_dir = Path(state.cwd) / ".files" if state.cwd else _IMAGES_DIR
+        files_dir.mkdir(parents=True, exist_ok=True)
+        audio_path = (
+            files_dir / f"{int(time.time())}_{update.message.voice.file_unique_id}.ogg"
+        )
+        audio_path.write_bytes(ogg_data)
+    except Exception as e:
+        logger.warning("Could not save voice audio to .files: %s", e)
+        audio_path = None
+
     # Transcribe
     try:
         text = await transcribe_voice(ogg_data)
@@ -797,7 +951,8 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.chat.send_action(ChatAction.TYPING)
     clear_status_msg_info(user.id, thread_id)
 
-    success, message = await session_manager.send_to_window(wid, text)
+    text_to_send = f"{text}\n\n(voice note audio: {audio_path})" if audio_path else text
+    success, message = await session_manager.send_to_window(wid, text_to_send)
     if not success:
         await safe_reply(update.message, f"❌ {message}")
         return
@@ -1760,6 +1915,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
         await query.answer("⇥ Tab")
 
+    # Interactive UI: Submit (Tab → Enter) — for AskUserQuestion where Enter
+    # on a choice only toggles, requiring navigation to the Submit row.
+    elif data.startswith(CB_ASK_SUBMIT):
+        window_id = data[len(CB_ASK_SUBMIT) :]
+        thread_id = _get_thread_id(update)
+        w = await tmux_manager.find_window_by_id(window_id)
+        if w:
+            await tmux_manager.send_keys(w.window_id, "Tab", enter=False, literal=False)
+            await asyncio.sleep(0.1)
+            await tmux_manager.send_keys(
+                w.window_id, "Enter", enter=False, literal=False
+            )
+            await asyncio.sleep(0.5)
+            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+        await query.answer("✅ Submit")
+
     # Interactive UI: refresh display
     elif data.startswith(CB_ASK_REFRESH):
         window_id = data[len(CB_ASK_REFRESH) :]
@@ -1839,7 +2010,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             # Mark interactive mode BEFORE sleeping so polling skips this window
             set_interactive_mode(user_id, wid, thread_id)
             # Flush pending messages (e.g. plan content) before sending interactive UI
-            queue = get_message_queue(user_id)
+            queue = get_message_queue(user_id, wid)
             if queue:
                 await queue.join()
             # Wait briefly for Claude Code to render the question UI
@@ -1910,7 +2081,12 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 
 
 async def post_init(application: Application) -> None:
-    global session_monitor, _status_poll_task
+    global \
+        session_monitor, \
+        _status_poll_task, \
+        _file_send_task, \
+        _hibernation_task, \
+        _ask_request_task
 
     await application.bot.delete_my_commands()
 
@@ -1922,6 +2098,7 @@ async def post_init(application: Application) -> None:
         BotCommand("kill", "Kill session and delete topic"),
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
         BotCommand("usage", "Show Claude Code usage remaining"),
+        BotCommand("idle", "List topics sorted by idle time + hibernation state"),
     ]
     # Add Claude Code slash commands
     for cmd_name, desc in CC_COMMANDS.items():
@@ -1957,9 +2134,18 @@ async def post_init(application: Application) -> None:
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
     logger.info("Status polling task started")
 
+    _file_send_task = asyncio.create_task(file_send_request_loop(application.bot))
+    logger.info("File send polling task started")
+
+    _hibernation_task = asyncio.create_task(hibernation_loop(application.bot))
+    logger.info("Hibernation task started")
+
+    _ask_request_task = asyncio.create_task(ask_request_loop())
+    logger.info("Ask request polling task started")
+
 
 async def post_shutdown(application: Application) -> None:
-    global _status_poll_task
+    global _status_poll_task, _file_send_task, _hibernation_task, _ask_request_task
 
     # Stop status polling
     if _status_poll_task:
@@ -1970,6 +2156,33 @@ async def post_shutdown(application: Application) -> None:
             pass
         _status_poll_task = None
         logger.info("Status polling stopped")
+
+    if _file_send_task:
+        _file_send_task.cancel()
+        try:
+            await _file_send_task
+        except asyncio.CancelledError:
+            pass
+        _file_send_task = None
+        logger.info("File send polling stopped")
+
+    if _hibernation_task:
+        _hibernation_task.cancel()
+        try:
+            await _hibernation_task
+        except asyncio.CancelledError:
+            pass
+        _hibernation_task = None
+        logger.info("Hibernation task stopped")
+
+    if _ask_request_task:
+        _ask_request_task.cancel()
+        try:
+            await _ask_request_task
+        except asyncio.CancelledError:
+            pass
+        _ask_request_task = None
+        logger.info("Ask request polling stopped")
 
     # Stop all queue workers
     await shutdown_workers()
@@ -1995,8 +2208,10 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("history", history_command))
     application.add_handler(CommandHandler("screenshot", screenshot_command))
     application.add_handler(CommandHandler("esc", esc_command))
+    application.add_handler(CommandHandler("file", file_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("usage", usage_command))
+    application.add_handler(CommandHandler("idle", idle_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
     # Topic closed event — auto-kill associated window
     application.add_handler(

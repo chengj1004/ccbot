@@ -69,3 +69,7 @@ venv.bak/
 # Project specific
 .uv/
 uv.lock
+
+# Runtime artifacts
+.files/
+.claude/skills/

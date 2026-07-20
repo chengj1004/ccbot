@@ -84,6 +84,12 @@ class Config:
 
         self.monitor_poll_interval = float(os.getenv("MONITOR_POLL_INTERVAL", "2.0"))
 
+        # Hibernation: idle seconds before claude in a window is stopped to
+        # free memory. 0 or negative disables the feature.
+        self.hibernate_after_seconds = int(
+            os.getenv("CCBOT_HIBERNATE_AFTER_SECONDS", "1800")
+        )
+
         # Display user messages in history and real-time notifications
         # When True, user messages are shown with a 👤 prefix
         self.show_user_messages = (
