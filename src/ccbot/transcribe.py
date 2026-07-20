@@ -25,8 +25,17 @@ def _get_client() -> httpx.AsyncClient:
     return _client
 
 
-async def transcribe_voice(ogg_data: bytes) -> str:
-    """Transcribe OGG voice data to text via OpenAI API.
+async def transcribe_voice(
+    audio_data: bytes,
+    filename: str = "voice.ogg",
+    mime_type: str = "audio/ogg",
+) -> str:
+    """Transcribe audio data to text via OpenAI API.
+
+    Args:
+        audio_data: Raw audio bytes (OGG, AMR, MP3, etc.)
+        filename: Filename hint for the API.
+        mime_type: MIME type of the audio data.
 
     Raises:
         httpx.HTTPStatusError: On API errors (401, 429, 5xx, etc.)
@@ -37,7 +46,7 @@ async def transcribe_voice(ogg_data: bytes) -> str:
     response = await client.post(
         url,
         headers={"Authorization": f"Bearer {config.openai_api_key}"},
-        files={"file": ("voice.ogg", ogg_data, "audio/ogg")},
+        files={"file": (filename, audio_data, mime_type)},
         data={"model": "gpt-4o-transcribe"},
     )
     response.raise_for_status()
