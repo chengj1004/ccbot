@@ -25,8 +25,10 @@ class TestParseStatusLine:
             ("✢", "Building project", "Building project"),
         ],
     )
-    def test_spinner_chars(self, spinner: str, rest: str, expected: str, chrome: str):
-        pane = f"some output\n{spinner}{rest}\n{chrome}"
+    def test_spinner_chars(
+        self, spinner: str, rest: str, expected: str, busy_chrome: str
+    ):
+        pane = f"some output\n{spinner}{rest}\n{busy_chrome}"
         assert parse_status_line(pane) == expected
 
     @pytest.mark.parametrize(
@@ -44,9 +46,9 @@ class TestParseStatusLine:
         pane = "output\n✻ Doing work\nno chrome here\n"
         assert parse_status_line(pane) is None
 
-    def test_blank_line_between_status_and_chrome(self, chrome: str):
+    def test_blank_line_between_status_and_chrome(self, busy_chrome: str):
         """Status line with blank lines before separator."""
-        pane = f"output\n✻ Doing work\n\n{chrome}"
+        pane = f"output\n✻ Doing work\n\n{busy_chrome}"
         assert parse_status_line(pane) == "Doing work"
 
     def test_idle_no_status(self, chrome: str):
@@ -57,6 +59,15 @@ class TestParseStatusLine:
     def test_false_positive_bullet(self, chrome: str):
         """· in regular output must NOT be detected as status."""
         pane = f"· bullet point one\n· bullet point two\nsome result\n{chrome}"
+        assert parse_status_line(pane) is None
+
+    def test_stale_summary_not_status(self, chrome: str):
+        """Idle chrome + past-tense summary (✻ Brewed for 10s) → None.
+
+        Without this guard, hibernation loop treats every completed turn
+        as still-busy and never sleeps the window.
+        """
+        pane = f"some assistant reply\n✻ Brewed for 10s\n{chrome}"
         assert parse_status_line(pane) is None
 
     def test_uses_fixture(self, sample_pane_status_line: str):

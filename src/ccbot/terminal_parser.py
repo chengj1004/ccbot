@@ -207,6 +207,12 @@ def parse_status_line(pane_text: str) -> str | None:
     the separator first, then check the line just above it — this avoids
     false positives from ``·`` bullets in Claude's regular output.
 
+    A live spinner is only meaningful while Claude is actually working.
+    When a turn completes, the last spinner frame stays on screen as
+    ``✻ Brewed for 10s`` etc. To distinguish live-busy from stale-summary,
+    we also require the bottom chrome to advertise ``esc to interrupt``
+    (present only while Claude is actively running).
+
     Returns the text after the spinner, or None if no status line found.
     """
     if not pane_text:
@@ -225,6 +231,12 @@ def parse_status_line(pane_text: str) -> str | None:
 
     if chrome_idx is None:
         return None  # No chrome visible — can't determine status
+
+    # Bottom chrome must show the "esc to interrupt" hint — Claude only
+    # renders it while a turn is running. Without it, any spinner char
+    # above is stale summary text ("✻ Brewed for 10s"), not live status.
+    if not any("esc to interrupt" in line for line in lines[chrome_idx + 1 :]):
+        return None
 
     # Check lines just above the separator (skip blanks, up to 4 lines)
     for i in range(chrome_idx - 1, max(chrome_idx - 5, -1), -1):

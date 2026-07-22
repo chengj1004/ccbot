@@ -132,7 +132,14 @@ _CHROME = (
     "──────────────────────────────────────\n"
     "❯ \n"
     "──────────────────────────────────────\n"
-    "  [Opus 4.6] Context: 50%\n"
+    "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
+)
+
+_BUSY_CHROME = (
+    "──────────────────────────────────────\n"
+    "❯ \n"
+    "──────────────────────────────────────\n"
+    "  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ctrl-o\n"
 )
 
 
@@ -142,8 +149,15 @@ def chrome():
 
 
 @pytest.fixture
+def busy_chrome():
+    return _BUSY_CHROME
+
+
+@pytest.fixture
 def sample_pane_status_line():
-    return "Some output text here\nMore output\n✻ Reading file src/main.py\n" + _CHROME
+    return (
+        "Some output text here\nMore output\n✻ Reading file src/main.py\n" + _BUSY_CHROME
+    )
 
 
 @pytest.fixture
