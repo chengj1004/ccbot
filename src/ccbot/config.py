@@ -97,6 +97,14 @@ class Config:
             os.getenv("CCBOT_HIBERNATE_AFTER_SECONDS", "1800")
         )
 
+        # Window display names to exclude from hibernation. Matches window_name
+        # (same as topic display name). Useful for sessions near their context
+        # limit, where Claude Code's autoCompact fires on every --resume.
+        no_hib = os.getenv("CCBOT_NO_HIBERNATE", "")
+        self.no_hibernate_windows: set[str] = {
+            n.strip() for n in no_hib.split(",") if n.strip()
+        }
+
         # Display user messages in history and real-time notifications
         # When True, user messages are shown with a 👤 prefix
         self.show_user_messages = (

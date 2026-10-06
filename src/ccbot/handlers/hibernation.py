@@ -64,6 +64,9 @@ async def _hibernate_idle_windows(timeout: int) -> None:
         if ws.hibernated:
             continue
 
+        if ws.window_name in config.no_hibernate_windows:
+            continue
+
         last = session_manager.get_last_activity(wid)
         if last is None:
             # First time we see this window — seed activity so we don't
