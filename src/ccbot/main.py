@@ -106,7 +106,12 @@ def _run_telegram() -> None:
     from .bot import create_bot
 
     application = create_bot()
-    application.run_polling(allowed_updates=["message", "callback_query"])
+    # PTB defaults bootstrap_retries=0: one ConnectTimeout on delete_webhook
+    # during startup exits the process. Retry forever instead.
+    application.run_polling(
+        allowed_updates=["message", "callback_query"],
+        bootstrap_retries=-1,
+    )
 
 
 def _run_wecom() -> None:
