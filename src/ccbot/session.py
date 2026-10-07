@@ -820,6 +820,15 @@ class SessionManager:
         encoded_cwd = self._encode_cwd(cwd)
         return config.claude_projects_path / encoded_cwd / f"{session_id}.jsonl"
 
+    def get_session_file_path(self, window_id: str) -> Path | None:
+        """JSONL path for a window's session, without reading the file.
+
+        Prefer this over resolve_session_for_window on per-message paths:
+        that one parses the whole transcript, which can be 100MB+.
+        """
+        state = self.get_window_state(window_id)
+        return self._build_session_file_path(state.session_id, state.cwd)
+
     async def _get_session_direct(
         self, session_id: str, cwd: str
     ) -> ClaudeSession | None:
@@ -1066,15 +1075,13 @@ class SessionManager:
         result: list[tuple[int, str, int]] = []
         if config.shared_binding:
             for thread_id, window_id in self.shared_thread_bindings.items():
-                resolved = await self.resolve_session_for_window(window_id)
-                if resolved and resolved.session_id == session_id:
+                if self.get_window_state(window_id).session_id == session_id:
                     # One entry per topic — message sent once to the shared topic
                     result.append((0, window_id, thread_id))
             return result
 
         for user_id, thread_id, window_id in self.iter_thread_bindings():
-            resolved = await self.resolve_session_for_window(window_id)
-            if resolved and resolved.session_id == session_id:
+            if self.get_window_state(window_id).session_id == session_id:
                 result.append((user_id, window_id, thread_id))
         return result
 
