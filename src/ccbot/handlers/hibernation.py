@@ -23,6 +23,7 @@ import time
 
 from telegram import Bot
 
+from ..background_tasks import background_tasks
 from ..config import config
 from ..session import session_manager
 from ..terminal_parser import is_interactive_ui, parse_status_line
@@ -65,6 +66,10 @@ async def _hibernate_idle_windows(timeout: int) -> None:
             continue
 
         if ws.window_name in config.no_hibernate_windows:
+            continue
+
+        # Background shells/subagents die with claude; don't stop them.
+        if ws.session_id and background_tasks.running(ws.session_id):
             continue
 
         last = session_manager.get_last_activity(wid)

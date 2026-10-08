@@ -23,6 +23,7 @@ import time
 from telegram import Bot
 from telegram.error import BadRequest
 
+from ..background_tasks import background_tasks
 from ..config import config
 from ..session import session_manager
 from ..terminal_parser import is_interactive_ui, parse_status_line
@@ -58,6 +59,9 @@ _stale_miss_counts: dict[str, int] = {}
 
 # Track consecutive Topic_id_invalid misses per thread_id
 _topic_probe_miss_counts: dict[int, int] = {}
+
+# (user_id, thread_id, window_id) currently showing a background-task status
+_bg_status_shown: set[tuple[int, int, str]] = set()
 
 
 async def update_status_message(
@@ -124,8 +128,10 @@ async def update_status_message(
         return
 
     status_line = parse_status_line(pane_text)
+    bg_key = (user_id, thread_id or 0, window_id)
 
     if status_line:
+        _bg_status_shown.discard(bg_key)
         await enqueue_status_update(
             bot,
             user_id,
@@ -133,7 +139,21 @@ async def update_status_message(
             status_line,
             thread_id=thread_id,
         )
-    # If no status line, keep existing status message (don't clear on transient state)
+        return
+
+    # Turn is idle. Keep a status message up while background shells or
+    # async subagents are still running, so the topic doesn't look finished.
+    session_id = session_manager.get_window_state(window_id).session_id
+    bg_status = background_tasks.format_status(session_id) if session_id else None
+    if bg_status:
+        _bg_status_shown.add(bg_key)
+        await enqueue_status_update(
+            bot, user_id, window_id, bg_status, thread_id=thread_id
+        )
+    elif bg_key in _bg_status_shown:
+        _bg_status_shown.discard(bg_key)
+        await enqueue_status_update(bot, user_id, window_id, None, thread_id=thread_id)
+    # Otherwise keep any existing status message (don't clear on transient state)
 
 
 async def status_poll_loop(bot: Bot) -> None:

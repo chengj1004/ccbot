@@ -20,6 +20,7 @@ from typing import Any, Callable, Awaitable
 
 import aiofiles
 
+from .background_tasks import background_tasks
 from .config import config
 from .monitor_state import MonitorState, TrackedSession
 from .tmux_manager import tmux_manager
@@ -79,6 +80,8 @@ class SessionMonitor:
         self._message_callback: Callable[[NewMessage], Awaitable[None]] | None = None
         # Per-session pending tool_use state carried across poll cycles
         self._pending_tools: dict[str, dict[str, Any]] = {}  # session_id -> pending
+        # Sessions whose background-task state was rebuilt in this process
+        self._bg_rebuilt: set[str] = set()
         # Track last known session_map for detecting changes
         # Keys may be window_id (@12) or window_name (old format) during transition
         self._last_session_map: dict[str, str] = {}  # window_key -> session_id
@@ -287,6 +290,14 @@ class SessionMonitor:
             try:
                 tracked = self.state.get_session(session_info.session_id)
 
+                if session_info.session_id not in self._bg_rebuilt:
+                    self._bg_rebuilt.add(session_info.session_id)
+                    await asyncio.to_thread(
+                        background_tasks.rebuild_from_file,
+                        session_info.session_id,
+                        session_info.file_path,
+                    )
+
                 if tracked is None:
                     # For new sessions, initialize offset to end of file
                     # to avoid re-processing old messages
@@ -327,6 +338,9 @@ class SessionMonitor:
                     tracked, session_info.file_path
                 )
                 self._file_mtimes[session_info.session_id] = current_mtime
+
+                for entry in new_entries:
+                    background_tasks.observe(session_info.session_id, entry)
 
                 if new_entries:
                     logger.debug(

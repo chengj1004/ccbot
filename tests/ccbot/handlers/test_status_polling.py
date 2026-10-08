@@ -139,3 +139,86 @@ class TestStatusPollerSettingsDetection:
             assert keyboard is not None
             # Verify the message text contains model picker content
             assert "Select model" in call_kwargs["text"]
+
+
+_IDLE_PANE = (
+    "● All merged.\n"
+    "✻ Baked for 12s · done 9:26 AM\n"
+    "──────────────────────────────────────\n"
+    "❯ \n"
+    "──────────────────────────────────────\n"
+    "  ⏵⏵ bypass permissions on · 1 shell · ← for agents\n"
+)
+
+_BUSY_PANE = (
+    "✽ Calculating… (25s · ↓ 2.0k tokens)\n"
+    "──────────────────────────────────────\n"
+    "❯ \n"
+    "──────────────────────────────────────\n"
+    "  ⏵⏵ bypass permissions on · esc to interrupt\n"
+)
+
+
+@pytest.mark.usefixtures("_clear_interactive_state")
+class TestBackgroundTaskStatus:
+    """Idle turn + running background tasks keeps a status message up."""
+
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        from ccbot.handlers.status_polling import _bg_status_shown
+
+        _bg_status_shown.clear()
+        yield
+        _bg_status_shown.clear()
+
+    async def _poll(self, mock_bot, pane: str, bg_status: str | None):
+        window = MagicMock()
+        window.window_id = "@1"
+        state = MagicMock()
+        state.session_id = "sess-1"
+        with (
+            patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
+            patch("ccbot.handlers.status_polling.session_manager") as mock_sm,
+            patch("ccbot.handlers.status_polling.background_tasks") as mock_bg,
+            patch(
+                "ccbot.handlers.status_polling.enqueue_status_update",
+                new_callable=AsyncMock,
+            ) as mock_enqueue,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=window)
+            mock_tmux.capture_pane = AsyncMock(return_value=pane)
+            mock_sm.get_window_state.return_value = state
+            mock_bg.format_status.return_value = bg_status
+            await update_status_message(
+                mock_bot, user_id=1, window_id="@1", thread_id=42
+            )
+            return mock_enqueue
+
+    @pytest.mark.asyncio
+    async def test_idle_with_background_tasks_shows_status(self, mock_bot):
+        bg = "⏳ Background · 1 shell: Run CI (3m)"
+        enqueue = await self._poll(mock_bot, _IDLE_PANE, bg)
+        enqueue.assert_awaited_once_with(mock_bot, 1, "@1", bg, thread_id=42)
+
+    @pytest.mark.asyncio
+    async def test_clears_status_once_background_tasks_finish(self, mock_bot):
+        await self._poll(mock_bot, _IDLE_PANE, "⏳ Background · 1 shell: Run CI (3m)")
+        enqueue = await self._poll(mock_bot, _IDLE_PANE, None)
+        enqueue.assert_awaited_once_with(mock_bot, 1, "@1", None, thread_id=42)
+        # Nothing more to clear on the following tick
+        enqueue = await self._poll(mock_bot, _IDLE_PANE, None)
+        enqueue.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_idle_without_background_tasks_leaves_status_alone(self, mock_bot):
+        enqueue = await self._poll(mock_bot, _IDLE_PANE, None)
+        enqueue.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_live_status_takes_precedence(self, mock_bot):
+        enqueue = await self._poll(
+            mock_bot, _BUSY_PANE, "⏳ Background · 1 shell: Run CI (3m)"
+        )
+        enqueue.assert_awaited_once_with(
+            mock_bot, 1, "@1", "Calculating… (25s · ↓ 2.0k tokens)", thread_id=42
+        )
