@@ -25,7 +25,7 @@ from typing import Literal
 
 from telegram import Bot
 from telegram.constants import ChatAction
-from telegram.error import RetryAfter
+from telegram.error import BadRequest, RetryAfter
 
 from ..config import config
 from ..markdown_v2 import convert_markdown
@@ -530,9 +530,21 @@ async def _process_status_update_task(
                 except RetryAfter:
                     raise
                 except Exception as e:
-                    logger.debug(f"Failed to edit status message: {e}")
-                    _status_msg_info.pop(skey, None)
-                    await _do_send_status_message(bot, user_id, tid, wid, status_text)
+                    if isinstance(e, BadRequest) and "not modified" in str(e).lower():
+                        # The first (MarkdownV2) attempt landed despite erroring
+                        _status_msg_info[skey] = (msg_id, wid, status_text)
+                    elif isinstance(e, BadRequest):
+                        # Message gone (deleted, too old): replace it. Keep the
+                        # tracking entry so the send path deletes the old one.
+                        logger.debug(f"Status message unusable, resending: {e}")
+                        await _do_send_status_message(
+                            bot, user_id, tid, wid, status_text
+                        )
+                    else:
+                        # Transient (timeout/network): keep the message and its
+                        # old text, so the next poll retries the edit instead
+                        # of stacking a new status message.
+                        logger.debug(f"Failed to edit status message: {e}")
     else:
         # No existing status message, send new
         await _do_send_status_message(bot, user_id, tid, wid, status_text)
@@ -685,6 +697,23 @@ async def enqueue_status_update(
         task = MessageTask(task_type="status_clear", thread_id=thread_id)
 
     queue.put_nowait(task)
+
+
+async def delete_all_status_messages(bot: Bot, timeout: float = 5.0) -> None:
+    """Delete every tracked status message (on shutdown).
+
+    Tracking lives in memory, so status messages left up at exit would be
+    orphaned and a fresh one sent after restart.
+    """
+    for (user_id, tid), (msg_id, _, _) in list(_status_msg_info.items()):
+        chat_id = session_manager.resolve_chat_id(user_id, tid or None)
+        try:
+            await asyncio.wait_for(
+                bot.delete_message(chat_id=chat_id, message_id=msg_id), timeout
+            )
+        except Exception as e:
+            logger.debug(f"Failed to delete status message {msg_id} on exit: {e}")
+    _status_msg_info.clear()
 
 
 def clear_status_msg_info(user_id: int, thread_id: int | None = None) -> None:

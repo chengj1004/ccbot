@@ -117,7 +117,7 @@ from .handlers.interactive_ui import (
     set_interactive_mode,
 )
 from .handlers.message_queue import (
-    clear_status_msg_info,
+    delete_all_status_messages,
     enqueue_content_message,
     enqueue_status_update,
     get_message_queue,
@@ -769,7 +769,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         text_to_send = f"(image attached: {file_path})"
 
     await update.message.chat.send_action(ChatAction.TYPING)
-    clear_status_msg_info(user.id, thread_id)
+    await enqueue_status_update(context.bot, user.id, wid, None, thread_id=thread_id)
 
     success, message = await session_manager.send_to_window(wid, text_to_send)
     if not success:
@@ -780,7 +780,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await safe_reply(update.message, "📷 Image sent to Claude Code.")
 
 
-async def document_handler(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle document files (xlsx, pdf, etc.): download and forward path to Claude Code."""
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
@@ -858,7 +858,7 @@ async def document_handler(update: Update, _context: ContextTypes.DEFAULT_TYPE) 
         text_to_send = f"(file attached: {file_path})"
 
     await update.message.chat.send_action(ChatAction.TYPING)
-    clear_status_msg_info(user.id, thread_id)
+    await enqueue_status_update(context.bot, user.id, wid, None, thread_id=thread_id)
 
     success, message = await session_manager.send_to_window(wid, text_to_send)
     if not success:
@@ -949,7 +949,7 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     await update.message.chat.send_action(ChatAction.TYPING)
-    clear_status_msg_info(user.id, thread_id)
+    await enqueue_status_update(context.bot, user.id, wid, None, thread_id=thread_id)
 
     text_to_send = f"{text}\n\n(voice note audio: {audio_path})" if audio_path else text
     success, message = await session_manager.send_to_window(wid, text_to_send)
@@ -2144,10 +2144,8 @@ async def post_init(application: Application) -> None:
     logger.info("Ask request polling task started")
 
 
-async def post_shutdown(application: Application) -> None:
-    global _status_poll_task, _file_send_task, _hibernation_task, _ask_request_task
-
-    # Stop status polling
+async def _stop_status_polling() -> None:
+    global _status_poll_task
     if _status_poll_task:
         _status_poll_task.cancel()
         try:
@@ -2156,6 +2154,21 @@ async def post_shutdown(application: Application) -> None:
             pass
         _status_poll_task = None
         logger.info("Status polling stopped")
+
+
+async def post_stop(application: Application) -> None:
+    """Remove live status messages while the bot can still make requests
+    (post_shutdown runs after PTB closes the HTTP client). Stop everything
+    that could post a new status first."""
+    await _stop_status_polling()
+    await shutdown_workers()
+    await delete_all_status_messages(application.bot)
+
+
+async def post_shutdown(application: Application) -> None:
+    global _file_send_task, _hibernation_task, _ask_request_task
+
+    await _stop_status_polling()
 
     if _file_send_task:
         _file_send_task.cancel()
@@ -2200,6 +2213,7 @@ def create_bot() -> Application:
         .token(config.telegram_bot_token)
         .rate_limiter(AIORateLimiter(max_retries=5))
         .post_init(post_init)
+        .post_stop(post_stop)
         .post_shutdown(post_shutdown)
         .build()
     )
