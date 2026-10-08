@@ -198,20 +198,30 @@ def is_interactive_ui(pane_text: str) -> bool:
 # Spinner characters Claude Code uses in its status line
 STATUS_SPINNERS = frozenset(["·", "✻", "✽", "✶", "✳", "✢"])
 
+# Completed-turn summary left on screen: "Baked for 1m 6s · done 8:25 AM"
+_RE_DONE_SUMMARY = re.compile(r"^\S+ for \d")
+
+
+def _is_live_status(text: str) -> bool:
+    """Live spinner text has an ellipsis before the timer: "Calculating… (25s"."""
+    return "…" in text.split("(", 1)[0]
+
 
 def parse_status_line(pane_text: str) -> str | None:
     """Extract the Claude Code status line from terminal output.
 
-    The status line (spinner + working text) appears immediately above
-    the chrome separator (a full line of ``─`` characters).  We locate
-    the separator first, then check the line just above it — this avoids
-    false positives from ``·`` bullets in Claude's regular output.
+    The status line (spinner + working text) sits just above the chrome
+    separator (a full line of ``─``), possibly with indented lines in
+    between (``⎿ Tip: …``, ``✔ Update installed``, a wrapped tail). The
+    first non-indented line above the separator must start with a spinner
+    — this avoids false positives from ``·`` bullets in regular output.
 
-    A live spinner is only meaningful while Claude is actually working.
-    When a turn completes, the last spinner frame stays on screen as
-    ``✻ Brewed for 10s`` etc. To distinguish live-busy from stale-summary,
-    we also require the bottom chrome to advertise ``esc to interrupt``
-    (present only while Claude is actively running).
+    When a turn completes, the last frame stays on screen as
+    ``✻ Baked for 12s · done 9:26 AM``. Live frames read
+    ``✽ Calculating… (25s · ↓ 2.0k tokens)``. We treat the line as busy
+    if its text has that ellipsis, or if the bottom chrome shows
+    ``esc to interrupt``. The ellipsis check matters because a narrow pane
+    truncates the chrome hint to ``esc to interru…``.
 
     Returns the text after the spinner, or None if no status line found.
     """
@@ -232,20 +242,19 @@ def parse_status_line(pane_text: str) -> str | None:
     if chrome_idx is None:
         return None  # No chrome visible — can't determine status
 
-    # Bottom chrome must show the "esc to interrupt" hint — Claude only
-    # renders it while a turn is running. Without it, any spinner char
-    # above is stale summary text ("✻ Brewed for 10s"), not live status.
-    if not any("esc to interrupt" in line for line in lines[chrome_idx + 1 :]):
-        return None
+    esc_hint = any("esc to interrupt" in line for line in lines[chrome_idx + 1 :])
 
-    # Check lines just above the separator (skip blanks, up to 4 lines)
-    for i in range(chrome_idx - 1, max(chrome_idx - 5, -1), -1):
-        line = lines[i].strip()
-        if not line:
+    for i in range(chrome_idx - 1, max(chrome_idx - 9, -1), -1):
+        raw = lines[i]
+        if not raw.strip() or raw[0].isspace():
             continue
-        if line[0] in STATUS_SPINNERS:
-            return line[1:].strip()
-        # First non-empty line above separator isn't a spinner → no status
+        if raw[0] not in STATUS_SPINNERS:
+            return None
+        text = raw[1:].strip()
+        if _RE_DONE_SUMMARY.match(text):
+            return None
+        if esc_hint or _is_live_status(text):
+            return text
         return None
     return None
 

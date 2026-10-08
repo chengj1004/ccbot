@@ -73,6 +73,39 @@ class TestParseStatusLine:
     def test_uses_fixture(self, sample_pane_status_line: str):
         assert parse_status_line(sample_pane_status_line) == "Reading file src/main.py"
 
+    _NARROW_BUSY_CHROME = (
+        "───────────────────────────────────────────\n"
+        "❯ \n"
+        "───────────────────────────────────────────\n"
+        "  ⏵⏵ bypass permissions on · 1 shell · esc to inte…\n"
+    )
+
+    def test_live_status_with_truncated_esc_hint(self):
+        """Narrow pane cuts "esc to interrupt"; the ellipsis still marks busy."""
+        pane = (
+            "● Working on it\n✽ Calculating… (25s · ↓ 2.0k tokens)\n"
+            + self._NARROW_BUSY_CHROME
+        )
+        assert parse_status_line(pane) == "Calculating… (25s · ↓ 2.0k tokens)"
+
+    def test_live_status_with_tip_lines_below(self):
+        pane = (
+            "· Discombobulating… (33s · ↓ 1.0k tokens)\n"
+            "  ⎿  Tip: Use /btw to ask a quick side question\n"
+            "     without interrupting Claude's current work\n"
+            + self._NARROW_BUSY_CHROME
+        )
+        assert parse_status_line(pane) == "Discombobulating… (33s · ↓ 1.0k tokens)"
+
+    def test_wrapped_done_summary_with_notice_not_status(self, chrome: str):
+        pane = (
+            "  - 合并了 29 个 PR。\n"
+            "✻ Baked for 1m 6s · done 8:25 AM · 1 shell still\n"
+            "  running\n"
+            "             ✔ Update installed · Restart to update\n" + chrome
+        )
+        assert parse_status_line(pane) is None
+
 
 # ── extract_interactive_content ──────────────────────────────────────────
 
