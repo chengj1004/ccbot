@@ -71,6 +71,11 @@ class TestFormatToolUseSummary:
             ("Glob", {"pattern": "*.py"}, "**Glob**(*.py)"),
             ("Task", {"description": "analyze code"}, "**Task**(analyze code)"),
             (
+                "Agent",
+                {"description": "Review PR", "subagent_type": "fork", "prompt": "x"},
+                "**Agent**(Review PR)",
+            ),
+            (
                 "WebFetch",
                 {"url": "https://example.com"},
                 "**WebFetch**(https://example.com)",
@@ -98,6 +103,7 @@ class TestFormatToolUseSummary:
             "Grep",
             "Glob",
             "Task",
+            "Agent",
             "WebFetch",
             "WebSearch",
             "TodoWrite",
@@ -508,3 +514,70 @@ class TestParseEntries:
         result, pending = TranscriptParser.parse_entries(entries)
         user_entries = [e for e in result if e.role == "user"]
         assert len(user_entries) == 0
+
+
+# ── task notifications ───────────────────────────────────────────────────
+
+
+def _notification_entry(*blocks: str) -> dict:
+    return {
+        "type": "user",
+        "origin": {"kind": "task-notification"},
+        "message": {"content": "\n".join(blocks)},
+    }
+
+
+def _block(status: str, summary: str, result: str = "") -> str:
+    res = f"<result>{result}</result>\n" if result else ""
+    return (
+        "<task-notification>\n<task-id>t1</task-id>\n"
+        f"<status>{status}</status>\n<summary>{summary}</summary>\n{res}"
+        "</task-notification>"
+    )
+
+
+class TestTaskNotifications:
+    @pytest.mark.parametrize(
+        "status, icon",
+        [("completed", "✅"), ("failed", "❌"), ("stopped", "⏹"), ("weird", "🔔")],
+    )
+    def test_shell_notification_becomes_status_line(self, status: str, icon: str):
+        summary = 'Background command "Run CI" finished'
+        entries, _ = TranscriptParser.parse_entries(
+            [_notification_entry(_block(status, summary))]
+        )
+        assert len(entries) == 1
+        assert entries[0].role == "assistant"
+        assert entries[0].content_type == "text"
+        assert entries[0].text == f"{icon} {summary}"
+
+    def test_agent_result_folded_into_expandable_quote(self):
+        entries, _ = TranscriptParser.parse_entries(
+            [
+                _notification_entry(
+                    _block("completed", 'Agent "Review" finished', "LGTM, 2 nits")
+                )
+            ]
+        )
+        assert entries[0].text == (
+            '✅ Agent "Review" finished\n'
+            + EXPQUOTE_START
+            + "LGTM, 2 nits"
+            + EXPQUOTE_END
+        )
+
+    def test_multiple_notifications_in_one_message(self):
+        entries, _ = TranscriptParser.parse_entries(
+            [
+                _notification_entry(
+                    _block("completed", "first done"), _block("failed", "second failed")
+                )
+            ]
+        )
+        assert entries[0].text == "✅ first done\n\n❌ second failed"
+
+    def test_regular_user_text_unchanged(self):
+        entries, _ = TranscriptParser.parse_entries(
+            [{"type": "user", "message": {"content": "hello"}}]
+        )
+        assert [(e.role, e.text) for e in entries] == [("user", "hello")]

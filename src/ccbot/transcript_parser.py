@@ -148,6 +148,40 @@ class TranscriptParser:
     _RE_SYSTEM_TAGS = re.compile(
         r"<(bash-input|bash-stdout|bash-stderr|local-command-caveat|system-reminder)"
     )
+    _RE_TASK_NOTIFICATION = re.compile(
+        r"<task-notification>(.*?)</task-notification>", re.DOTALL
+    )
+    _TASK_STATUS_ICONS = {
+        "completed": "✅",
+        "failed": "❌",
+        "stopped": "⏹",
+        "killed": "⏹",
+    }
+
+    @staticmethod
+    def _xml_field(text: str, tag: str) -> str:
+        m = re.search(rf"<{tag}>(.*?)</{tag}>", text, re.DOTALL)
+        return m.group(1).strip() if m else ""
+
+    @classmethod
+    def format_task_notifications(cls, text: str) -> str | None:
+        """Render <task-notification> blocks (background shell / async agent
+        finished) as one status line each; an agent's result is folded into
+        an expandable quote. Returns None if the text has no notification."""
+        blocks = cls._RE_TASK_NOTIFICATION.findall(text)
+        if not blocks:
+            return None
+        lines = []
+        for block in blocks:
+            status = cls._xml_field(block, "status")
+            icon = cls._TASK_STATUS_ICONS.get(status, "🔔")
+            summary = cls._xml_field(block, "summary") or f"Background task {status}"
+            line = f"{icon} {summary}"
+            result = cls._xml_field(block, "result")
+            if result:
+                line += "\n" + cls._format_expandable_quote(result)
+            lines.append(line)
+        return "\n\n".join(lines)
 
     @staticmethod
     def _format_edit_diff(old_string: str, new_string: str) -> str:
@@ -192,7 +226,7 @@ class TranscriptParser:
             summary = input_data.get("command", "")
         elif name == "Grep":
             summary = input_data.get("pattern", "")
-        elif name == "Task":
+        elif name in ("Task", "Agent"):
             summary = input_data.get("description", "")
         elif name == "WebFetch":
             summary = input_data.get("url", "")
@@ -727,8 +761,20 @@ class TranscriptParser:
                 # Add user text if present (skip if message was only tool_results)
                 if user_text_parts:
                     combined = "\n".join(user_text_parts)
+                    notification = cls.format_task_notifications(combined)
+                    if notification:
+                        # Sent by Claude Code, not the user — show it even
+                        # when user-message echo is off, without the 👤 prefix.
+                        result.append(
+                            ParsedEntry(
+                                role="assistant",
+                                text=notification,
+                                content_type="text",
+                                timestamp=entry_timestamp,
+                            )
+                        )
                     # Skip if it looks like local command XML
-                    if not cls._RE_LOCAL_STDOUT.search(
+                    elif not cls._RE_LOCAL_STDOUT.search(
                         combined
                     ) and not cls._RE_COMMAND_NAME.search(combined):
                         result.append(
